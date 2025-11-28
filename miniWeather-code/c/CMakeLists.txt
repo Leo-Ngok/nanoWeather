@@ -19,6 +19,12 @@ endif()
 if ("${OUT_FREQ}" STREQUAL "")
   SET(OUT_FREQ 10)
 endif()
+# TODO
+# Options available
+# DATA_SPEC_{COLLISION|THERMAL|GRAVITY_WAVES|DENSITY_CURRENT_INJECTION}
+# Refer to miniWeather_mpi_openmp.cpp:44-48
+# Modify also in vscode C/C++ configurations
+
 if ("${DATA_SPEC}" STREQUAL "")
   SET(DATA_SPEC DATA_SPEC_THERMAL)
 endif()

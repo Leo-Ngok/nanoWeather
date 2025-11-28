@@ -15,3 +15,5 @@ cmake -DCMAKE_CXX_COMPILER=mpicxx                                               
       -DOUT_FREQ=50                                                                 \
       ..
 
+# TODO: Revert NX to 3200
+# TODO: Revert NZ to 1600

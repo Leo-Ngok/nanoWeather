@@ -1,0 +1,7 @@
+miniWeather-code/c/build
+*.o
+.vscode
+*.log
+**/vtune_res*/**
+*.nc
+*.txt

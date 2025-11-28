@@ -15,6 +15,32 @@
 #include <mpi.h>
 #include "pnetcdf.h"
 #include <chrono>
+#include <omp.h>
+#include <climits>
+#include <cassert>
+
+// Test Case Default Parameters.
+// override with cmake -DNX=Value ...
+
+#ifndef _NX
+#define _NX 3200
+#endif
+
+#ifndef _NZ
+#define _NZ 1600
+#endif
+
+#ifndef _SIM_TIME
+#define _SIM_TIME 300
+#endif
+
+#ifndef _OUT_FREQ
+#define _OUT_FREQ 50
+#endif
+
+#ifndef _DATA_SPEC
+#define _DATA_SPEC DATA_SPEC_COLLISION
+#endif
 
 constexpr double pi        = 3.14159265358979323846264338327;   //Pi
 constexpr double grav      = 9.8;                               //Gravitational acceleration (m / s^2)
@@ -23,6 +49,7 @@ constexpr double cv        = 717.;                              //Specific heat 
 constexpr double rd        = 287.;                              //Dry air constant for equation of state (P=rho*rd*T)
 constexpr double p0        = 1.e5;                              //Standard pressure at the surface in Pascals
 constexpr double C0        = 27.5629410929725921310572974482;   //Constant to translate potential temperature into pressure (P=C0*(rho*theta)**gamma)
+constexpr double _gamma = cp / rd;
 constexpr double gamm      = 1.40027894002789400278940027894;   //gamma=cp/Rd , have to call this gamm because "gamma" is taken (I hate C so much)
 //Define domain and stability-related constants
 constexpr double xlen      = 2.e4;    //Length of the domain in the x-direction (meters)
@@ -87,11 +114,29 @@ double *hy_pressure_int;      //hydrostatic press (vert cell interf).   Dimensio
 ///////////////////////////////////////////////////////////////////////////////////////
 double etime;                 //Elapsed model time
 double output_counter;        //Helps determine when it's time to do output
+  // state              = (double *) malloc( (nx+2*hs)*(nz+2*hs)*NUM_VARS*sizeof(double) );
+  // state_tmp          = (double *) malloc( (nx+2*hs)*(nz+2*hs)*NUM_VARS*sizeof(double) );
+  // flux               = (double *) malloc( (nx+1)*(nz+1)*NUM_VARS*sizeof(double) );
+  // tend               = (double *) malloc( nx*nz*NUM_VARS*sizeof(double) );
+  // hy_dens_cell       = (double *) malloc( (nz+2*hs)*sizeof(double) );
+  // hy_dens_theta_cell = (double *) malloc( (nz+2*hs)*sizeof(double) );
+  // hy_dens_int        = (double *) malloc( (nz+1)*sizeof(double) );
+  // hy_dens_theta_int  = (double *) malloc( (nz+1)*sizeof(double) );
+  // hy_pressure_int    = (double *) malloc( (nz+1)*sizeof(double) );
+  // sendbuf_l          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
+  // sendbuf_r          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
+  // recvbuf_l          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
+  // recvbuf_r          = (double *) malloc( hs*nz*NUM_VARS*sizeof(double) );
 //Runtime variable arrays
+// [nx + 2hs][nz + 2hs][NUM_VARS]
 double *state;                //Fluid state.             Dimensions: (1-hs:nx+hs,1-hs:nz+hs,NUM_VARS)
+// [nx + 2hs][nz + 2hs][NUM_VARS]
 double *state_tmp;            //Fluid state.             Dimensions: (1-hs:nx+hs,1-hs:nz+hs,NUM_VARS)
+// [nx + 1][nz + 1][NUM_VARS]
 double *flux;                 //Cell interface fluxes.   Dimensions: (nx+1,nz+1,NUM_VARS)
+// [nx][nz][NUM_VARS]
 double *tend;                 //Fluid state tendencies.  Dimensions: (nx,nz,NUM_VARS)
+// 
 double *sendbuf_l;            //Buffer to send data to the left MPI rank
 double *sendbuf_r;            //Buffer to send data to the right MPI rank
 double *recvbuf_l;            //Buffer to receive data from the left MPI rank
@@ -102,8 +147,57 @@ double mass0, te0;            //Initial domain totals for mass and total energy
 double mass , te ;            //Domain totals for mass and total energy  
 
 //How is this not in the standard?!
-double dmin( double a , double b ) { if (a<b) {return a;} else {return b;} };
+constexpr double dmin( double a , double b ) { return (a < b) ? a : b; }
 
+double base_min = NC_MAX_DOUBLE;
+double base_max = -NC_MAX_DOUBLE;
+
+template<int X0>
+inline __attribute__((always_inline))
+double pow_binomial(double base) {
+  // there is no constexpr double pow(a, b)
+  // so only this can solve. What a mess!!
+  static double x0_gamma = pow(X0, gamm);
+  static double c1 =  1.400278940027894    * x0_gamma;
+  static double c2 =  0.2802510849288743   * x0_gamma;
+  static double c3 = -0.056024159237292384 * x0_gamma;
+  static double c4 =  0.02240575684978186  * x0_gamma;
+  static double c5 = -0.011649743589398433 * x0_gamma;
+  static double c6 =  0.00698930455700543  * x0_gamma;
+  // x ** gamma
+  // = x0 ** gamma * (x / x0) ** gamma
+  // = x0 ** gamma * (1 + (x/x0) -1) ** gamma
+  // beta = x/x0 - 1
+  // x = x0_gamma * (1 + gamma * beta + gamma * (gamma - 1) / 2 * beta ** 2 + ...)
+  // = x0_gamma + c1 * beta + c2 * beta ** 2 + ...
+  // we take up to c6
+  static double invX0 = 1. / X0;
+  double b1 = base * invX0 - 1;
+  double b2 = b1 * b1;
+  double b3 = b2 * b1;
+  double b4 = b2 * b2;
+  double b5 = b3 * b2;
+  double b6 = b4 * b2;
+  return x0_gamma + c1 * b1 + c2 * b2 + c3 * b3 + c4 * b4 + c5 * b5 + c6 * b6;
+}
+#define POW_X0_BRANCH(X0) if((base) < (X0 + 60)) { return pow_binomial<X0>(base); }
+// inline __attribute__((always_inline))
+double pow_pole(double base, double exponent) {
+  // #pragma omp critical
+  // {
+  //   base_min = base < base_min ? base : base_min;
+  //   base_max = base > base_max ? base : base_max;
+  // }
+  // return pow(base, exponent); 
+  POW_X0_BRANCH(120)
+  // POW_X0_BRANCH(180)
+  POW_X0_BRANCH(240)
+  // POW_X0_BRANCH(300)
+  POW_X0_BRANCH(360)
+  // POW_X0_BRANCH(420)
+  // , "Don't try to even go here!!"
+  assert(false);
+}
 
 //Declaring the functions defined after "main"
 void   init                 ( int *argc , char ***argv );
@@ -133,6 +227,28 @@ void   reductions           ( double &mass , double &te );
 int main(int argc, char **argv) {
 
   init( &argc , &argv );
+  #pragma omp parallel 
+  {
+    #pragma omp master 
+    {
+      auto nthreads = omp_get_num_threads();
+      auto threadid = omp_get_thread_num();
+      
+      std::cerr
+      << "MPI World Size = " << nranks
+      << ", MPI World Rank = " << myrank 
+      << ", Nthreads: " << nthreads 
+      << ", thread id: " << threadid << std::endl;
+    }
+  }
+  if(myrank == 0) {
+    std::cerr 
+    << "[VERBOSE] [CONFIGURATION PARAMETERS]" << std::endl
+    << "NX = " << nx_glob << std::endl
+    << "NZ = " << nz_glob << std::endl
+    << "SIMULATION TIME (S) = " <<sim_time << std::endl
+    << "OUTPUT TIME ELAPSED (S) = " << output_freq << std::endl; 
+  }
 
   //Initial reductions for mass, kinetic energy, and total energy
   reductions(mass0,te0);
@@ -169,7 +285,8 @@ int main(int argc, char **argv) {
 
   //Final reductions for mass, kinetic energy, and total energy
   reductions(mass,te);
-
+  // std::cerr << "Base pow min = " << base_min << std::endl;
+  // std::cerr << "Baase pow max = " << base_max << std::endl;
   if (mainproc) {
     printf( "d_mass: %le\n" , (mass - mass0)/mass0 );
     printf( "d_te:   %le\n" , (te   - te0  )/te0   );
@@ -280,7 +397,9 @@ void compute_tendencies_x( double *state , double *flux , double *tend , double 
   for (k=0; k<nz; k++) {
     for (i=0; i<nx+1; i++) {
       //Use fourth-order interpolation from four cell averages to compute the value at the interface in question
+      #pragma unroll
       for (ll=0; ll<NUM_VARS; ll++) {
+        #pragma unroll
         for (s=0; s < sten_size; s++) {
           inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+s;
           stencil[s] = state[inds];
@@ -296,7 +415,7 @@ void compute_tendencies_x( double *state , double *flux , double *tend , double 
       u = vals[ID_UMOM] / r;
       w = vals[ID_WMOM] / r;
       t = ( vals[ID_RHOT] + hy_dens_theta_cell[k+hs] ) / r;
-      p = C0*pow((r*t),gamm);
+      p = C0*pow_pole((r*t),gamm);
 
       //Compute the flux vector
       flux[ID_DENS*(nz+1)*(nx+1) + k*(nx+1) + i] = r*u     - hv_coef*d3_vals[ID_DENS];
@@ -347,11 +466,14 @@ void compute_tendencies_z( double *state , double *flux , double *tend , double 
       }
 
       //Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p respectively)
+      // density
       r = vals[ID_DENS] + hy_dens_int[k];
       u = vals[ID_UMOM] / r;
       w = vals[ID_WMOM] / r;
+      // potential temperature
       t = ( vals[ID_RHOT] + hy_dens_theta_int[k] ) / r;
-      p = C0*pow((r*t),gamm) - hy_pressure_int[k];
+      // pressure
+      p = C0*pow_pole((r*t),gamm) - hy_pressure_int[k];
       //Enforce vertical boundary condition and exact mass conservation
       if (k == 0 || k == nz) {
         w                = 0;
@@ -784,7 +906,9 @@ void output( double *state , double etime ) {
       dens [k*nx+i] = state[ind_r];
       uwnd [k*nx+i] = state[ind_u] / ( hy_dens_cell[k+hs] + state[ind_r] );
       wwnd [k*nx+i] = state[ind_w] / ( hy_dens_cell[k+hs] + state[ind_r] );
-      theta[k*nx+i] = ( state[ind_t] + hy_dens_theta_cell[k+hs] ) / ( hy_dens_cell[k+hs] + state[ind_r] ) - hy_dens_theta_cell[k+hs] / hy_dens_cell[k+hs];
+      theta[k*nx+i] = 
+      ( state[ind_t] + hy_dens_theta_cell[k+hs] ) / ( hy_dens_cell[k+hs] + state[ind_r] ) 
+      - hy_dens_theta_cell[k+hs] / hy_dens_cell[k+hs];
     }
   }
 
