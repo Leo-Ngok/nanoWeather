@@ -5,3 +5,6 @@ miniWeather-code/c/build
 **/vtune_res*/**
 *.nc
 *.txt
+*.asm
+*.out
+**/intel/**
