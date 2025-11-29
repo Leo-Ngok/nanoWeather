@@ -16,12 +16,16 @@
 # mpirun -np 96 -ppn 48 -bind-to core -genv I_MPI_DEBUG=5 -genv I_MPI_PIN=1 -genv I_MPI_PIN_DOMAIN=core \
 # -genv OMP_NUM_THREADS=1 -genv OMP_PLACES=threads -genv OMP_PROC_BIND=close \
 # ./build/openmp > logs/openmp_test_debug_$1.log
+salloc --nodes=2 --exclusive \
+mpirun -np 96 -ppn 48 -bind-to core -genv I_MPI_DEBUG=5 -genv I_MPI_PIN=1 -genv I_MPI_PIN_DOMAIN=core \
+-genv OMP_NUM_THREADS=1 -genv OMP_PLACES=threads -genv OMP_PROC_BIND=close \
+./build/openmp > logs/openmp_test_debug_$1.log
 
 # 2 x 24 x 2 --> 105 = 80 + 35s
-salloc --nodes=2 --exclusive --cpus-per-task=2 \
-mpirun -np 48 -ppn 24 -bind-to core -genv I_MPI_DEBUG=5 -genv I_MPI_PIN=1 -genv I_MPI_PIN_DOMAIN=core \
--genv OMP_NUM_THREADS=2 -genv OMP_PLACES=threads -genv OMP_PROC_BIND=close \
-./build/openmp > logs/openmp_test_debug_$1.log
+# salloc --nodes=2 --exclusive --cpus-per-task=2 \
+# mpirun -np 48 -ppn 24 -bind-to core -genv I_MPI_DEBUG=5 -genv I_MPI_PIN=1 -genv I_MPI_PIN_DOMAIN=core \
+# -genv OMP_NUM_THREADS=2 -genv OMP_PLACES=threads -genv OMP_PROC_BIND=close \
+# ./build/openmp > logs/openmp_test_debug_$1.log
 
 # 2 x 12 x 4 --> 158 = 150 + 8
 

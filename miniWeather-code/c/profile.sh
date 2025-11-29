@@ -113,5 +113,5 @@ mpirun -np 96 -ppn 48 -bind-to core -genv I_MPI_DEBUG=5 -genv I_MPI_PIN=1 -genv 
 # salloc --nodes=2 --exclusive --ntasks-per-node=12 --cpus-per-task=4 \
 # mpirun -np 24 -ppn 12 -bind-to core -genv I_MPI_DEBUG=5 -genv I_MPI_PIN=1 -genv I_MPI_PIN_DOMAIN=core \
 # -genv OMP_NUM_THREADS=4 -genv OMP_PLACES=threads -genv OMP_PROC_BIND=close \
-# `which vtune` -collect hotspots -r ../vtune_res$1 \
+# `which vtune` -collect uarch-exploration -r ../vtune_res$1 \
 # ./build/openmp > logs/openmp_test_profile_$1.log
