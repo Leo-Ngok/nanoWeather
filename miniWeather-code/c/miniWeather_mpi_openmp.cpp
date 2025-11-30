@@ -21,6 +21,7 @@
 #include <climits>
 #include <cassert>
 #include <immintrin.h>
+#include <tuple>
 
 // Test Case Default Parameters.
 // override with cmake -DNX=Value ...
@@ -103,7 +104,8 @@ double constexpr invdz = 1. / dz;
 // Variables that are initialized but remain static over the course of the simulation
 ///////////////////////////////////////////////////////////////////////////////////////
 double dt;                    //Model time step (seconds)
-int    nx, nz;                //Number of local grid cells in the x- and z- dimensions for this MPI task
+int    nx/*, nz*/;                //Number of local grid cells in the x- and z- dimensions for this MPI task
+constexpr int nz = nz_glob;
 int    i_beg, k_beg;          //beginning index in the x- and z-directions for this MPI task
 int    nranks, myrank;        //Number of MPI ranks and my rank id
 int    left_rank, right_rank; //MPI Rank IDs that exist to my left and right in the global domain
@@ -145,6 +147,7 @@ double *state_tmp;            //Fluid state.             Dimensions: (1-hs:nx+hs
 double *flux;                 //Cell interface fluxes.   Dimensions: (nx+1,nz+1,NUM_VARS)
 // initial configurations
 #define FLUX_(ll, z, x) flux[(ll)*(nz+1)*(nx+1) + (z)*(nx+1) + (x)]
+#define FLUX_Z_(ll, z, x) flux[(ll)*(nz+1)*(nx+1) + (z) + (x) * (nz + 1)]
 // in most cases z -> x -> ll
 
 
@@ -165,7 +168,7 @@ double mass , te ;            //Domain totals for mass and total energy
 //How is this not in the standard?!
 constexpr double dmin( double a , double b ) { return (a < b) ? a : b; }
 
-template<int X0>
+template<int X0, typename T>
 inline __attribute__((always_inline))
 double C0_pow_binomial(double base) {
   // there is no constexpr double pow(a, b)
@@ -193,7 +196,7 @@ double C0_pow_binomial(double base) {
   double b6 = b3 * b3;
   return x0_gamma + c1 * b1 + c2 * b2 + c3 * b3 + c4 * b4 + c5 * b5 + c6 * b6;
 }
-#define C0_POW_X0_BRANCH(X0) if((base) < (X0 + 60)) { return C0_pow_binomial<X0>(base); }
+#define C0_POW_X0_BRANCH(X0) if((base) < (X0 + 60)) { return C0_pow_binomial<X0, double>(base); }
 
 double C0_pow_pole(double base) {
   C0_POW_X0_BRANCH(120)
@@ -202,6 +205,17 @@ double C0_pow_pole(double base) {
   return C0 * pow(base, gamm);
 }
 
+__always_inline
+__m512d C0_pow_pole_m512(__m512d base) {
+  alignas(16) double _base[8];
+  alignas(16) double _res[8];
+  _mm512_store_pd(_base, base);
+  #pragma unroll
+  for(int k = 0; k < 8; k++) {
+    _res[k] = C0_pow_pole(_base[k]);
+  }
+  return _mm512_load_pd(_res);
+}
 
 #define CHECK_MPI(res) do {\
   auto ret = (res); \
@@ -225,7 +239,7 @@ void   ncwrap               ( int ierr , int line );
 void   perform_timestep     ( double *state , double *state_tmp , double *flux , double *tend , double dt );
 void   semi_discrete_step   ( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux , double *tend );
 void   reduce_tendencies_x ( double *state , double *flux , double *tend , double dt);
-void   compute_tendencies_z ( double *state , double *flux , double *tend , double dt);
+void   reduce_tendencies_z ( double *state , double *flux , double *tend , double dt);
 void   flux_x               ( double *state , double *flux , double dt, int x0, int x1);
 void   flux_halo_x               ( double *state , double *flux , double dt);
 void   flux_z               ( double *state , double *flux , double dt);
@@ -371,15 +385,13 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
     flux_x(state_forcing, flux, dt, sten_size - hs, nx + 1 - (sten_size - hs));
     recv_halo_values_x(state_forcing);
     flux_halo_x(state_forcing, flux, dt);
-    // flux_x(state_forcing, flux, dt, 0, sten_size - hs);
-    // flux_x(state_forcing, flux, dt, nx + 1 - (sten_size - hs), nx + 1);
     reduce_tendencies_x(state_forcing,flux,tend,dt);
   } else if (dir == DIR_Z) {
     //Set the halo values for this MPI task's fluid state in the z-direction
     set_halo_values_z(state_forcing);
     //Compute the time tendencies for the fluid state in the z-direction
     flux_z(state_forcing, flux, dt);
-    compute_tendencies_z(state_forcing,flux,tend,dt);
+    reduce_tendencies_z(state_forcing,flux,tend,dt);
   }
 
   //Apply the tendencies to the fluid state
@@ -432,7 +444,7 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
 }
 
 // __always_inline
-void flux_x_zx(double *state, double *flux, double hv_coef, double dt, int z, int x) {
+void flux_x_zx(double *state, double *flux, double hv_coef, int z, int x) {
   double stencil[sten_size];
   double vals[NUM_VARS];
   double d3_vals[NUM_VARS];
@@ -456,7 +468,6 @@ void flux_x_zx(double *state, double *flux, double hv_coef, double dt, int z, in
   u = vals[ID_UMOM] / r;
   w = vals[ID_WMOM] / r;
   t = ( vals[ID_RHOT] + hy_dens_theta_cell[z+hs] /*hy_dens_theta_cell_khs*/ ) / r;
-  // p = C0*pow_pole((r*t),gamm);
   p = C0_pow_pole(r * t);
   //Compute the flux vector
   FLUX_(ID_DENS, z, x) = r*u     - hv_coef*d3_vals[ID_DENS];
@@ -465,17 +476,47 @@ void flux_x_zx(double *state, double *flux, double hv_coef, double dt, int z, in
   FLUX_(ID_RHOT, z, x) = r*u*t   - hv_coef*d3_vals[ID_RHOT];
 }
 
+void flux_x_zx_v2(double *state, double *flux, double hv_coef, double dt, int z, int x) {
+  __m512d r,u,w,t,p;
+  auto _do_stencil = [=] (int ll_) {
+    __m512d s0 = _mm512_loadu_pd(&STATE(ll_, z + hs, x));
+    __m512d s1 = _mm512_loadu_pd(&STATE(ll_, z + hs, x + 1));
+    __m512d s2 = _mm512_loadu_pd(&STATE(ll_, z + hs, x + 2));
+    __m512d s3 = _mm512_loadu_pd(&STATE(ll_, z + hs, x + 3));
+    __m512d fourth = (-s0 + 7 * (s1 + s2) - s3) / 12.;
+    __m512d first = -s0 + 3 * (s1 - s2) + s3;
+    return std::make_tuple(fourth, first);
+  };
+  auto [val_dens, d3_dens] = _do_stencil(ID_DENS);
+  auto [val_umom, d3_umom] = _do_stencil(ID_UMOM);
+  auto [val_wmom, d3_wmom] = _do_stencil(ID_WMOM);
+  auto [val_rhot, d3_rhot] = _do_stencil(ID_RHOT);
+  //Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p respectively)
+  r = val_dens + hy_dens_cell[z + hs];
+  u = val_umom / r;
+  w = val_wmom / r;
+  t = (val_rhot + hy_dens_theta_cell[z + hs]) / r;
+  p = C0_pow_pole_m512(r * t);
+  //Compute the flux vector
+  
+  _mm512_storeu_pd(&FLUX_(ID_DENS, z, x) , r*u     - hv_coef*d3_dens); //d3_vals[ID_DENS];
+  _mm512_storeu_pd(&FLUX_(ID_UMOM, z, x) , r*u*u+p - hv_coef*d3_umom); //d3_vals[ID_UMOM];
+  _mm512_storeu_pd(&FLUX_(ID_WMOM, z, x) , r*u*w   - hv_coef*d3_wmom); // [ID_WMOM];
+  _mm512_storeu_pd(&FLUX_(ID_RHOT, z, x) , r*u*t   - hv_coef*d3_rhot); // d3_vals[ID_RHOT];
+}
+
 void flux_x(double *state , double *flux , double dt, int x0, int x1) {
   // loop variables
   int k, i;
   double hv_coef = -hv_beta * dx / (16*dt);
-
-  #pragma omp parallel for collapse(2)
+  int x8 = (nx + 1 - 2 * (sten_size - hs)) & -8;
+  #pragma omp parallel for collapse(1) schedule(static)
   for (k=0; k<nz; k++) {
-    // double hy_dens_cell_khs = hy_dens_cell[k + hs];
-    // double hy_dens_theta_cell_khs = hy_dens_theta_cell[k + hs];
-    for (i=sten_size - hs; i < nx + 1 - (sten_size - hs); i++) {
-      flux_x_zx(state, flux, hv_coef, dt, k, i);
+    for(i = sten_size - hs; i < sten_size - hs + x8; i += 8) {
+      flux_x_zx_v2(state, flux, hv_coef, dt, k, i);
+    }
+    for(i = sten_size - hs + x8; i < nx + 1 - (sten_size - hs); i++) {
+      flux_x_zx(state, flux, hv_coef, k, i);
     }
   }
 }
@@ -490,10 +531,10 @@ void flux_halo_x(double *state , double *flux , double dt) {
   #pragma omp parallel for collapse(1) schedule(static)
   for (k=0; k<nz; k++) {
     for (i=0; i < (sten_size - hs); i++) {
-      flux_x_zx(state, flux, hv_coef, dt, k, i);
+      flux_x_zx(state, flux, hv_coef, k, i);
     }
     for (i=nx + 1 - (sten_size - hs); i < nx + 1; i++) {
-      flux_x_zx(state, flux, hv_coef, dt, k, i);
+      flux_x_zx(state, flux, hv_coef, k, i);
     }
   }
 }
@@ -517,52 +558,156 @@ void reduce_tendencies_x( double *state , double *flux , double *tend , double d
   }
 }
 
+double state_z_packed[NUM_VARS][nz + 2 * hs];
+
+void pack_state_z(int x, double *state) {
+  for(int ll = 0; ll < NUM_VARS; ++ll)
+  for(int i = 0; i < nz + 2 * hs; ++i) {
+    state_z_packed[ll][i] = STATE(ll, i, x + hs);
+  }
+}
+
+void flux_z_zx(double *flux, double hv_coef, int z, int x) {
+  double r,u,w,t,p, stencil[sten_size], d3_vals[NUM_VARS], vals[NUM_VARS];
+
+  //Use fourth-order interpolation from four cell averages to compute the value at the interface in question
+  #pragma unroll
+  for (int ll=0; ll<NUM_VARS; ll++) {
+    // bad to cache affinity.
+    #pragma unroll
+    for (int s=0; s<sten_size; s++) {
+      stencil[s] = state_z_packed[ll][z + s]; //STATE(ll, z + s, x + hs);
+    }
+    //Fourth-order-accurate interpolation of the state
+    vals[ll] = -stencil[0]/12 + 7*stencil[1]/12 + 7*stencil[2]/12 - stencil[3]/12;
+    //First-order-accurate interpolation of the third spatial derivative of the state
+    d3_vals[ll] = -stencil[0] + 3*(stencil[1] - stencil[2]) + stencil[3];
+  }
+
+  //Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p respectively)
+  // density
+  r = vals[ID_DENS] + hy_dens_int[z];
+  u = vals[ID_UMOM] / r;
+  w = vals[ID_WMOM] / r;
+  // potential temperature
+  t = ( vals[ID_RHOT] + hy_dens_theta_int[z] ) / r;
+  // pressure
+  p = C0_pow_pole(r * t) - hy_pressure_int[z];
+  //Enforce vertical boundary condition and exact mass conservation
+  if (z == 0 || z == nz) [[unlikely]] {
+    w                = 0;
+    d3_vals[ID_DENS] = 0;
+  }
+
+  //Compute the flux vector with hyperviscosity
+  FLUX_Z_(ID_DENS, z, x) = r*w     - hv_coef*d3_vals[ID_DENS];
+  FLUX_Z_(ID_UMOM, z, x) = r*w*u   - hv_coef*d3_vals[ID_UMOM];
+  FLUX_Z_(ID_WMOM, z, x) = r*w*w+p - hv_coef*d3_vals[ID_WMOM];
+  FLUX_Z_(ID_RHOT, z, x) = r*w*t   - hv_coef*d3_vals[ID_RHOT];
+}
+
+
+void flux_z_zx_v2(double *flux, double hv_coef, int z, int x) {
+  __m512d r,u,w,t,p; // , stencil[sten_size], d3_vals[NUM_VARS], vals[NUM_VARS];
+  auto _do_stencil = [=] (int ll_) {
+    // __m512d s0 = _mm512_loadu_pd(&STATE(ll_, z + hs, x));
+    // __m512d s1 = _mm512_loadu_pd(&STATE(ll_, z + hs, x + 1));
+    // __m512d s2 = _mm512_loadu_pd(&STATE(ll_, z + hs, x + 2));
+    // __m512d s3 = _mm512_loadu_pd(&STATE(ll_, z + hs, x + 3));
+    __m512d s0 = _mm512_loadu_pd(&state_z_packed[ll_][z + 0]);
+    __m512d s1 = _mm512_loadu_pd(&state_z_packed[ll_][z + 1]);
+    __m512d s2 = _mm512_loadu_pd(&state_z_packed[ll_][z + 2]);
+    __m512d s3 = _mm512_loadu_pd(&state_z_packed[ll_][z + 3]);
+    __m512d fourth = (-s0 + 7 * (s1 + s2) - s3) / 12.;
+    __m512d first = -s0 + 3 * (s1 - s2) + s3;
+    return std::make_tuple(fourth, first);
+  };
+  auto [val_dens, d3_dens] = _do_stencil(ID_DENS);
+  auto [val_umom, d3_umom] = _do_stencil(ID_UMOM);
+  auto [val_wmom, d3_wmom] = _do_stencil(ID_WMOM);
+  auto [val_rhot, d3_rhot] = _do_stencil(ID_RHOT);
+  //Use fourth-order interpolation from four cell averages to compute the value at the interface in question
+  // #pragma unroll
+  // for (int ll=0; ll<NUM_VARS; ll++) {
+  //   // bad to cache affinity.
+  //   #pragma unroll
+  //   for (int s=0; s<sten_size; s++) {
+  //     stencil[s] = state_z_packed[ll][z + s]; //STATE(ll, z + s, x + hs);
+  //   }
+  //   //Fourth-order-accurate interpolation of the state
+  //   vals[ll] = -stencil[0]/12 + 7*stencil[1]/12 + 7*stencil[2]/12 - stencil[3]/12;
+  //   //First-order-accurate interpolation of the third spatial derivative of the state
+  //   d3_vals[ll] = -stencil[0] + 3*(stencil[1] - stencil[2]) + stencil[3];
+  // }
+
+  //Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p respectively)
+  // density
+  r = val_dens + _mm512_loadu_pd(&hy_dens_int[z]);
+  u = val_umom / r;
+  w = val_wmom / r;
+  // potential temperature
+  t = ( val_rhot + _mm512_loadu_pd(&hy_dens_theta_int[z]) ) / r;
+  // pressure
+  p = C0_pow_pole_m512(r * t) - _mm512_loadu_pd(&hy_pressure_int[z]);
+  //Enforce vertical boundary condition and exact mass conservation
+  // if (z == 0 || z == nz) [[unlikely]] {
+  //   w[0] = 0.;
+  //   // w                = 0;
+  //   d3_vals[ID_DENS] = 0;
+  // }
+  if(z == 0) [[unlikely]] {
+    w[0] = 0.;
+    d3_dens[0] = 0.;
+  }
+  if(z + 7 == nz) [[unlikely]] {
+    w[7] = 0.;
+    d3_dens[7] = 0.;
+  }
+
+  // //Compute the flux vector with hyperviscosity
+  // FLUX_Z_(ID_DENS, z, x) = r*w     - hv_coef*d3_vals[ID_DENS];
+  // FLUX_Z_(ID_UMOM, z, x) = r*w*u   - hv_coef*d3_vals[ID_UMOM];
+  // FLUX_Z_(ID_WMOM, z, x) = r*w*w+p - hv_coef*d3_vals[ID_WMOM];
+  // FLUX_Z_(ID_RHOT, z, x) = r*w*t   - hv_coef*d3_vals[ID_RHOT];
+
+  // r = val_dens + hy_dens_cell[z + hs];
+  // u = val_umom / r;
+  // w = val_wmom / r;
+  // t = (val_rhot + hy_dens_theta_cell[z + hs]) / r;
+  // p = C0_pow_pole_m512(r * t);
+  //Compute the flux vector
+  
+  _mm512_storeu_pd(&FLUX_Z_(ID_DENS, z, x) , r*u     - hv_coef*d3_dens); //d3_vals[ID_DENS];
+  _mm512_storeu_pd(&FLUX_Z_(ID_UMOM, z, x) , r*u*u+p - hv_coef*d3_umom); //d3_vals[ID_UMOM];
+  _mm512_storeu_pd(&FLUX_Z_(ID_WMOM, z, x) , r*u*w   - hv_coef*d3_wmom); // [ID_WMOM];
+  _mm512_storeu_pd(&FLUX_Z_(ID_RHOT, z, x) , r*u*t   - hv_coef*d3_rhot);
+}
+
+
 void flux_z(double *state , double *flux , double dt) {
   // loop variables
   int k, i, ll, s;
-  int inds;
   double r,u,w,t,p, stencil[sten_size], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
   //Compute the hyperviscosity coefficient
   hv_coef = -hv_beta * dz / (16*dt);
+  constexpr int z8 = (nz + 1) & -8;
   //Compute fluxes in the x-direction for each cell
-#pragma omp parallel for private(inds,stencil,vals,d3_vals,r,u,w,t,p,ll,s) collapse(2)
-  for (k=0; k<nz+1; k++) {
-    for (i=0; i<nx; i++) {
-      //Use fourth-order interpolation from four cell averages to compute the value at the interface in question
-      #pragma unroll
-      for (ll=0; ll<NUM_VARS; ll++) {
-        #pragma unroll
-        for (s=0; s<sten_size; s++) {
-          // inds = ll*(nz+2*hs)*(nx+2*hs) + (k+s)*(nx+2*hs) + i+hs;
-          stencil[s] = STATE(ll, k + s, i + hs);//state[inds];
-        }
-        //Fourth-order-accurate interpolation of the state
-        vals[ll] = -stencil[0]/12 + 7*stencil[1]/12 + 7*stencil[2]/12 - stencil[3]/12;
-        //First-order-accurate interpolation of the third spatial derivative of the state
-        d3_vals[ll] = -stencil[0] + 3*(stencil[1] - stencil[2]) + stencil[3];
-      }
-
-      //Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p respectively)
-      // density
-      r = vals[ID_DENS] + hy_dens_int[k];
-      u = vals[ID_UMOM] / r;
-      w = vals[ID_WMOM] / r;
-      // potential temperature
-      t = ( vals[ID_RHOT] + hy_dens_theta_int[k] ) / r;
-      // pressure
-      // p = C0*pow_pole((r*t),gamm) - hy_pressure_int[k];
-      p = C0_pow_pole(r * t) - hy_pressure_int[k];
-      //Enforce vertical boundary condition and exact mass conservation
-      if (k == 0 || k == nz) {
-        w                = 0;
-        d3_vals[ID_DENS] = 0;
-      }
-
-      //Compute the flux vector with hyperviscosity
-      FLUX_(ID_DENS, k, i) = r*w     - hv_coef*d3_vals[ID_DENS];
-      FLUX_(ID_UMOM, k, i) = r*w*u   - hv_coef*d3_vals[ID_UMOM];
-      FLUX_(ID_WMOM, k, i) = r*w*w+p - hv_coef*d3_vals[ID_WMOM];
-      FLUX_(ID_RHOT, k, i) = r*w*t   - hv_coef*d3_vals[ID_RHOT];
+#pragma omp parallel for collapse(1)
+  for (i=0; i<nx; i++) {
+    pack_state_z(i, state);
+    for (k=0; k<z8; k+=8) {
+      // flux_z_zx_v2(flux, hv_coef, k, i);
+      flux_z_zx(flux, hv_coef, k, i);
+      flux_z_zx(flux, hv_coef, k+1, i);
+      flux_z_zx(flux, hv_coef, k+2, i);
+      flux_z_zx(flux, hv_coef, k+3, i);
+      flux_z_zx(flux, hv_coef, k+4, i);
+      flux_z_zx(flux, hv_coef, k+4, i);
+      flux_z_zx(flux, hv_coef, k+6, i);
+      flux_z_zx(flux, hv_coef, k+7, i);
+    }
+    for (k=z8; k<nz+1; k++) {
+      flux_z_zx(flux, hv_coef, k, i);
     }
   }
 }
@@ -571,7 +716,7 @@ void flux_z(double *state , double *flux , double dt) {
 //Since the halos are set in a separate routine, this will not require MPI
 //First, compute the flux vector at each cell interface in the z-direction (including hyperviscosity)
 //Then, compute the tendencies using those fluxes
-void compute_tendencies_z( double *state , double *flux , double *tend , double dt ) {
+void reduce_tendencies_z( double *state , double *flux , double *tend , double dt ) {
   int    i,k,ll,s, inds, indt;
 
   //Use the fluxes to compute tendencies for each cell
@@ -580,7 +725,7 @@ void compute_tendencies_z( double *state , double *flux , double *tend , double 
     for (k=0; k<nz; k++) {
       for (i=0; i<nx; i++) {
         indt  = ll* nz   * nx    + k* nx    + i  ;
-        TEND_(ll, k, i) =  -(FLUX_(ll, k+1, i) - FLUX_(ll, k, i)) * invdz;
+        TEND_(ll, k, i) =  -(FLUX_Z_(ll, k+1, i) - FLUX_Z_(ll, k, i)) * invdz;
         if (ll == ID_WMOM) {
           TEND_(ll, k, i) -= STATE(ID_DENS, k + hs, i + hs);
         }
@@ -664,15 +809,15 @@ void set_halo_values_z( double *state ) {
         STATE(ll, nz + hs    , i) = 0.;
         STATE(ll, nz + hs + 1, i) = 0.;
       } else if (ll == ID_UMOM) {
-        STATE(ll, 0          , i) = state[ll*(nz+2*hs)*(nx+2*hs) + (hs     )*(nx+2*hs) + i] / hy_dens_cell[hs     ] * hy_dens_cell[0      ];
-        STATE(ll, 1          , i) = state[ll*(nz+2*hs)*(nx+2*hs) + (hs     )*(nx+2*hs) + i] / hy_dens_cell[hs     ] * hy_dens_cell[1      ];
-        STATE(ll, nz + hs    , i) = state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs-1)*(nx+2*hs) + i] / hy_dens_cell[nz+hs-1] * hy_dens_cell[nz+hs  ];
-        STATE(ll, nz + hs + 1, i) = state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs-1)*(nx+2*hs) + i] / hy_dens_cell[nz+hs-1] * hy_dens_cell[nz+hs+1];
+        STATE(ll, 0          , i) = STATE(ll, hs, i) / hy_dens_cell[hs     ] * hy_dens_cell[0      ];
+        STATE(ll, 1          , i) = STATE(ll, hs, i) / hy_dens_cell[hs     ] * hy_dens_cell[1      ];
+        STATE(ll, nz + hs    , i) = STATE(ll, nz + hs - 1, i) / hy_dens_cell[nz+hs-1] * hy_dens_cell[nz+hs  ];
+        STATE(ll, nz + hs + 1, i) = STATE(ll, nz + hs - 1, i) / hy_dens_cell[nz+hs-1] * hy_dens_cell[nz+hs+1];
       } else {
-        STATE(ll, 0, i) = state[ll*(nz+2*hs)*(nx+2*hs) + (hs     )*(nx+2*hs) + i];
-        state[ll*(nz+2*hs)*(nx+2*hs) + (1      )*(nx+2*hs) + i] = state[ll*(nz+2*hs)*(nx+2*hs) + (hs     )*(nx+2*hs) + i];
-        state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs  )*(nx+2*hs) + i] = state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs-1)*(nx+2*hs) + i];
-        state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs+1)*(nx+2*hs) + i] = state[ll*(nz+2*hs)*(nx+2*hs) + (nz+hs-1)*(nx+2*hs) + i];
+        STATE(ll, 0          , i) = STATE(ll, hs, i); 
+        STATE(ll, 1          , i) = STATE(ll, hs, i); 
+        STATE(ll, nz + hs    , i) = STATE(ll, nz + hs - 1, i); 
+        STATE(ll, nz + hs + 1, i) = STATE(ll, nz + hs - 1, i);
       }
     }
   }
@@ -705,7 +850,8 @@ void init( int *argc , char ***argv ) {
 
   //Vertical direction isn't MPI-ized, so the rank's local values = the global values
   k_beg = 0;
-  nz = nz_glob;
+  // do that outside !!!
+  // nz = nz_glob;
   mainproc = (myrank == 0);
 
   //Allocate the model data
@@ -1066,14 +1212,10 @@ void reductions( double &mass , double &te ) {
   #pragma omp parallel for reduction(+:mass_loc,te_loc)
   for (int k=0; k<nz; k++) {
     for (int i=0; i<nx; i++) {
-      int ind_r = ID_DENS*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-      int ind_u = ID_UMOM*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-      int ind_w = ID_WMOM*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-      int ind_t = ID_RHOT*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-      double r  =   state[ind_r] + hy_dens_cell[hs+k];             // Density
-      double u  =   state[ind_u] / r;                              // U-wind
-      double w  =   state[ind_w] / r;                              // W-wind
-      double th = ( state[ind_t] + hy_dens_theta_cell[hs+k] ) / r; // Potential Temperature (theta)
+      double r  =   STATE(ID_DENS, k + hs, i + hs) + hy_dens_cell[hs+k];             // Density
+      double u  =   STATE(ID_UMOM, k + hs, i + hs) / r;                              // U-wind
+      double w  =   STATE(ID_WMOM, k + hs, i + hs) / r;                              // W-wind
+      double th = ( STATE(ID_RHOT, k + hs, i + hs) + hy_dens_theta_cell[hs+k] ) / r; // Potential Temperature (theta)
       double p  = C0*pow(r*th,gamm);                               // Pressure
       double t  = th / pow(p0/p,rd/cp);                            // Temperature
       double ke = r*(u*u+w*w);                                     // Kinetic Energy

@@ -5,7 +5,7 @@ export TEST_MPI_COMMAND="mpirun -n 1"
 bash ./cmake_clean.sh
 
 cmake -DCMAKE_CXX_COMPILER=mpicxx                                                   \
-      -DCXXFLAGS="-O3 -std=c++20 -I$(spack location -i parallel-netcdf)/include"    \
+      -DCXXFLAGS="-O3 -std=c++20 -mavx512f -I$(spack location -i parallel-netcdf)/include"    \
       -DLDFLAGS="-L$(spack location -i parallel-netcdf)/lib -lpnetcdf"              \
       -DOPENMP_FLAGS="-fopenmp"                                                     \
       -DNX=3200                                                                     \
