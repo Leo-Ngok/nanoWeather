@@ -21,6 +21,7 @@
 #include <climits>
 #include <cassert>
 #include <immintrin.h>
+#include <tuple>
 
 // Test Case Default Parameters.
 // override with cmake -DNX=Value ...
@@ -200,6 +201,18 @@ double C0_pow_pole(double base) {
   C0_POW_X0_BRANCH(240)
   C0_POW_X0_BRANCH(360)
   return C0 * pow(base, gamm);
+}
+
+__always_inline
+__m512d C0_pow_pole_m512(__m512d base) {
+  alignas(16) double _base[8];
+  alignas(16) double _res[8];
+  _mm512_store_pd(_base, base);
+  #pragma unroll
+  for(int k = 0; k < 8; k++) {
+    _res[k] = C0_pow_pole(_base[k]);
+  }
+  return _mm512_load_pd(_res);
 }
 
 
@@ -465,17 +478,53 @@ void flux_x_zx(double *state, double *flux, double hv_coef, double dt, int z, in
   FLUX_(ID_RHOT, z, x) = r*u*t   - hv_coef*d3_vals[ID_RHOT];
 }
 
+void flux_x_zx_v2(double *state, double *flux, double hv_coef, double dt, int z, int x) {
+  __m512d r,u,w,t,p;
+  auto _do_stencil = [=] (int ll_) {
+    __m512d s0 = _mm512_loadu_pd(&STATE(ll_, z + hs, x));
+    __m512d s1 = _mm512_loadu_pd(&STATE(ll_, z + hs, x + 1));
+    __m512d s2 = _mm512_loadu_pd(&STATE(ll_, z + hs, x + 2));
+    __m512d s3 = _mm512_loadu_pd(&STATE(ll_, z + hs, x + 3));
+    __m512d fourth = (-s0 + 7 * (s1 + s2) - s3) / 12.;
+    __m512d first = -s0 + 3 * (s1 - s2) + s3;
+    return std::make_tuple(fourth, first);
+  };
+  auto [val_dens, d3_dens] = _do_stencil(ID_DENS);
+  auto [val_umom, d3_umom] = _do_stencil(ID_UMOM);
+  auto [val_wmom, d3_wmom] = _do_stencil(ID_WMOM);
+  auto [val_rhot, d3_rhot] = _do_stencil(ID_RHOT);
+  //Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p respectively)
+  r = val_dens + hy_dens_cell[z + hs];
+  u = val_umom / r;
+  w = val_wmom / r;
+  t = (val_rhot + hy_dens_theta_cell[z + hs]) / r;
+  p = C0_pow_pole_m512(r * t);
+  //Compute the flux vector
+  
+  _mm512_storeu_pd(&FLUX_(ID_DENS, z, x) , r*u     - hv_coef*d3_dens); //d3_vals[ID_DENS];
+  _mm512_storeu_pd(&FLUX_(ID_UMOM, z, x) , r*u*u+p - hv_coef*d3_umom); //d3_vals[ID_UMOM];
+  _mm512_storeu_pd(&FLUX_(ID_WMOM, z, x) , r*u*w   - hv_coef*d3_wmom); // [ID_WMOM];
+  _mm512_storeu_pd(&FLUX_(ID_RHOT, z, x) , r*u*t   - hv_coef*d3_rhot); // d3_vals[ID_RHOT];
+}
+
 void flux_x(double *state , double *flux , double dt, int x0, int x1) {
   // loop variables
   int k, i;
   double hv_coef = -hv_beta * dx / (16*dt);
-
-  #pragma omp parallel for collapse(2)
+  const int x8 = nx + 1 - 2 * (sten_size - hs);
+  const int x8_end = sten_size - hs + x8;
+  #pragma omp parallel for collapse(1)
   for (k=0; k<nz; k++) {
     // double hy_dens_cell_khs = hy_dens_cell[k + hs];
     // double hy_dens_theta_cell_khs = hy_dens_theta_cell[k + hs];
-    for (i=sten_size - hs; i < nx + 1 - (sten_size - hs); i++) {
-      flux_x_zx(state, flux, hv_coef, dt, k, i);
+    // for (i=sten_size - hs; i < nx + 1 - (sten_size - hs); i++) {
+    //   flux_x_zx(state, flux, hv_coef, dt, k, i);
+    // }
+    for(i = sten_size - hs; i < x8_end; i += 8) {
+      flux_x_zx_v2(state, flux, hv_coef, dt, k ,i);
+    }
+    for(i = x8_end; i < nx + 1 - (sten_size - hs); i++) {
+      flux_x_zx(state, flux, hv_coef, dt,k, i);
     }
   }
 }
@@ -572,21 +621,32 @@ void flux_z(double *state , double *flux , double dt) {
 //First, compute the flux vector at each cell interface in the z-direction (including hyperviscosity)
 //Then, compute the tendencies using those fluxes
 void compute_tendencies_z( double *state , double *flux , double *tend , double dt ) {
-  int    i,k,ll,s, inds, indt;
+  int    i,k,ll,s;
 
   //Use the fluxes to compute tendencies for each cell
-#pragma omp parallel for private(indt,inds) collapse(3)
-  for (ll=0; ll<NUM_VARS; ll++) {
+  for (ll=0; ll<2; ll++) {
+    #pragma omp parallel for schedule(static)
     for (k=0; k<nz; k++) {
+      #pragma omp simd
       for (i=0; i<nx; i++) {
-        indt  = ll* nz   * nx    + k* nx    + i  ;
         TEND_(ll, k, i) =  -(FLUX_(ll, k+1, i) - FLUX_(ll, k, i)) * invdz;
-        if (ll == ID_WMOM) {
-          TEND_(ll, k, i) -= STATE(ID_DENS, k + hs, i + hs);
-        }
       }
     }
   }
+  #pragma omp parallel for schedule(static)
+  for(k = 0; k < nz; k++) {
+    #pragma omp simd
+    for(i = 0; i < nx; i++){
+      TEND_(ID_WMOM, k, i) = -(FLUX_(ID_WMOM, k+1, i) - FLUX_(ID_WMOM, k, i)) * invdz - STATE(ID_DENS, k + hs, i + hs);
+    }
+  }
+  #pragma omp parallel for schedule(static)
+    for (k=0; k<nz; k++) {
+      #pragma omp simd
+      for (i=0; i<nx; i++) {
+        TEND_(ID_RHOT, k, i) =  -(FLUX_(ID_RHOT, k+1, i) - FLUX_(ID_RHOT, k, i)) * invdz;
+      }
+    }
 }
 
 MPI_Request req_r[2], req_s[2];
