@@ -250,8 +250,10 @@ void   compute_tendencies_x ( double *state , double *flux , double *tend , doub
 void   compute_tendencies_halo_x ( double *state , double *flux , double *tend , double dt, bool fuse_tend_upd,
                             double *state_init, double *state_out);
 void   compute_tendencies_z ( double *state , double *flux , double *tend , double dt, bool fuse_tend_update,double *state_init, double *state_out);
-void   flux_x               ( double *state , double *flux , double dt);
-void   flux_halo_x          ( double *state , double *flux , double dt);
+void   flux_x               ( double *state , double *flux , double dt,
+bool fuse_flux_update,double *state_init, double *state_out );
+void   flux_halo_x          ( double *state , double *flux , double dt,
+bool fuse_flux_update,double *state_init, double *state_out);
 void   flux_z               ( double *state , double *flux , double dt,
 bool fuse_flux_update,double *state_init, double *state_out);
 void   set_halo_values_x    ( double *state );
@@ -460,11 +462,11 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
     //Apply the tendencies to the fluid state
     if constexpr(data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
       send_halo_values_x(state_forcing);
-      flux_x(state_forcing, flux, dt);
+      flux_x(state_forcing, flux, dt, false, state_init, state_out);
       recv_halo_values_x(state_forcing);
       compute_tendencies_x(state_forcing,flux,tend,dt, false, state_init, state_out);
       //Compute the time tendencies for the fluid state in the x-direction
-      flux_halo_x(state_forcing, flux, dt);
+      flux_halo_x(state_forcing, flux, dt, false, state_init, state_out);
       compute_tendencies_halo_x(state_forcing,flux,tend,dt, false, state_init, state_out);
       #pragma omp parallel for private(inds,indt,x,z,x0,z0,xrad,zrad,amp,dist,wpert,indw) collapse(2/*3*/)
       for (ll=0; ll<NUM_VARS; ll++) {
@@ -506,12 +508,22 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
       }
     } else {
       send_halo_values_x(state_forcing);
-      flux_x(state_forcing, flux, dt);
+      if(state_forcing == state_out) {
+      flux_x(state_forcing, flux, dt, false, state_init, state_out);
       compute_tendencies_x(state_forcing,flux,tend,dt, true, state_init, state_out);
+      } else{
+      flux_x(state_forcing, flux, dt, true, state_init, state_out);
+      // compute_tendencies_x(state_forcing,flux,tend,dt, true, state_init, state_out);
+      }
       recv_halo_values_x(state_forcing);
       //Compute the time tendencies for the fluid state in the x-direction
-      flux_halo_x(state_forcing, flux, dt);
+      if(state_forcing == state_out) {
+      flux_halo_x(state_forcing, flux, dt, false, state_init, state_out);
       compute_tendencies_halo_x(state_forcing,flux,tend,dt, true, state_init, state_out);
+      } else {
+      flux_halo_x(state_forcing, flux, dt, true, state_init, state_out);
+      // compute_tendencies_halo_x(state_forcing,flux,tend,dt, true, state_init, state_out);
+      }
     }
   
   } else if (dir == DIR_Z) {
@@ -616,7 +628,8 @@ auto do_flux_x(double *state, double hv_coef, int k, int i) {
 
 }
 
-void flux_halo_x(double *state , double *flux , double dt) {
+void flux_halo_x(double *state , double *flux , double dt,
+bool fuse_flux_update,double *state_init, double *state_out ) {
   // loop variables
   int k, i /*, ll, s*/;
   // int inds;
@@ -626,37 +639,99 @@ void flux_halo_x(double *state , double *flux , double dt) {
   // double vals[NUM_VARS];
   // double d3_vals[NUM_VARS];
   // double r,u,w,t,p;
+  if(fuse_flux_update) {
 
-  #pragma omp parallel for /*private(inds,stencil,vals,d3_vals,r,u,w,t,p,ll,s)*/ collapse(1)
+  #pragma omp parallel for collapse(1)
   for (k=0; k<nz; k++) {
     // double hy_dens_cell_khs = hy_dens_cell[k + hs];
     // double hy_dens_theta_cell_khs = hy_dens_theta_cell[k + hs];
-    for (i=0; i<sten_size - hs; i++) {
+    double dens_prev, umom_prev, wmom_prev, rhot_prev;
+    i = 0;
+    auto [dens, umom, wmom, rhot] = do_flux_x(state, hv_coef, k ,i);
+    dens_prev = dens; umom_prev = umom; wmom_prev = wmom; rhot_prev = rhot;
+    for (i=1; i<sten_size - hs + 1; i++) {
       auto [dens, umom, wmom, rhot] = do_flux_x(state, hv_coef, k ,i);
-      FLUX_(ID_DENS, k, i) = dens;
-      FLUX_(ID_UMOM, k, i) = umom;
-      FLUX_(ID_WMOM, k, i) = wmom;
-      FLUX_(ID_RHOT, k, i) = rhot;
+      double flux_prev[] = {dens_prev, umom_prev, wmom_prev, rhot_prev};
+      double flux_curr[] = {dens, umom, wmom, rhot};
+      for(int ll = 0; ll < NUM_VARS; ll++) {
+        int inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i- 1+hs;
+        // state_out[inds] = state_init[inds] -( FLUX_(ll, k, i) - FLUX_(ll, k, i - 1) ) * invdx * dt;
+        
+        state_out[inds] = state_init[inds] -( flux_curr[ll] - flux_prev[ll] ) * invdx * dt;
+      }
+      
+      dens_prev = dens; umom_prev = umom; wmom_prev = wmom; rhot_prev = rhot;
     }
-
+    i = (nx) - (sten_size - hs);
+    auto [dens_, umom_, wmom_, rhot_] = do_flux_x(state, hv_coef, k ,i);
+    dens_prev = dens_; umom_prev = umom_; wmom_prev = wmom_; rhot_prev = rhot_;
     for (i=(nx + 1) - (sten_size - hs); i<nx + 1; i++) {
       auto [dens, umom, wmom, rhot] = do_flux_x(state, hv_coef, k ,i);
-      FLUX_(ID_DENS, k, i) = dens;
-      FLUX_(ID_UMOM, k, i) = umom;
-      FLUX_(ID_WMOM, k, i) = wmom;
-      FLUX_(ID_RHOT, k, i) = rhot;
+      double flux_prev[] = {dens_prev, umom_prev, wmom_prev, rhot_prev};
+      double flux_curr[] = {dens, umom, wmom, rhot};
+      for(int ll = 0; ll < NUM_VARS; ll++) {
+        int inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i- 1+hs;
+        // state_out[inds] = state_init[inds] -( FLUX_(ll, k, i) - FLUX_(ll, k, i - 1) ) * invdx * dt;
+        state_out[inds] = state_init[inds] -( flux_curr[ll] - flux_prev[ll] ) * invdx * dt;
+      }
+      dens_prev = dens; umom_prev = umom; wmom_prev = wmom; rhot_prev = rhot;
+    }
+  
+  }
+  } else {
+    #pragma omp parallel for /*private(inds,stencil,vals,d3_vals,r,u,w,t,p,ll,s)*/ collapse(1)
+    for (k=0; k<nz; k++) {
+      // double hy_dens_cell_khs = hy_dens_cell[k + hs];
+      // double hy_dens_theta_cell_khs = hy_dens_theta_cell[k + hs];
+      for (i=0; i<sten_size - hs; i++) {
+        auto [dens, umom, wmom, rhot] = do_flux_x(state, hv_coef, k ,i);
+        FLUX_(ID_DENS, k, i) = dens;
+        FLUX_(ID_UMOM, k, i) = umom;
+        FLUX_(ID_WMOM, k, i) = wmom;
+        FLUX_(ID_RHOT, k, i) = rhot;
+      }
+
+      for (i=(nx + 1) - (sten_size - hs); i<nx + 1; i++) {
+        auto [dens, umom, wmom, rhot] = do_flux_x(state, hv_coef, k ,i);
+        FLUX_(ID_DENS, k, i) = dens;
+        FLUX_(ID_UMOM, k, i) = umom;
+        FLUX_(ID_WMOM, k, i) = wmom;
+        FLUX_(ID_RHOT, k, i) = rhot;
+      }
     }
   }
 }
 
 
 
-void flux_x(double *state , double *flux , double dt) {
+void flux_x(double *state , double *flux , double dt,
+bool fuse_flux_update,double *state_init, double *state_out ) {
   // loop variables
   int k, i /*, ll, s*/;
   double hv_coef = -hv_beta * dx / (16*dt);
-
-  #pragma omp parallel for collapse(1)
+  if(fuse_flux_update) {
+#pragma omp parallel for collapse(1)
+  for (k=0; k<nz; k++) {
+    double dens_prev, umom_prev, wmom_prev, rhot_prev;
+    i = (sten_size - hs);
+    auto [dens, umom, wmom, rhot] = do_flux_x(state, hv_coef, k ,i);
+    dens_prev = dens; umom_prev = umom; wmom_prev = wmom; rhot_prev = rhot;
+    for (i=(sten_size - hs) + 1; i<nx+1 - (sten_size - hs); i++) {
+      auto [dens, umom, wmom, rhot] = do_flux_x(state, hv_coef, k ,i);
+      double flux_prev[] = {dens_prev, umom_prev, wmom_prev, rhot_prev};
+      double flux_curr[] = {dens, umom, wmom, rhot};
+      for(int ll = 0; ll < NUM_VARS; ll++) {
+        int inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i- 1+hs;
+        // state_out[inds] = state_init[inds] -( FLUX_(ll, k, i) - FLUX_(ll, k, i - 1) ) * invdx * dt;
+        
+        state_out[inds] = state_init[inds] -( flux_curr[ll] - flux_prev[ll] ) * invdx * dt;
+      }
+      
+      dens_prev = dens; umom_prev = umom; wmom_prev = wmom; rhot_prev = rhot;
+    }
+  }
+  } else {
+#pragma omp parallel for collapse(1)
   for (k=0; k<nz; k++) {
     for (i=(sten_size - hs); i<nx+1 - (sten_size - hs); i++) {
       
@@ -667,6 +742,8 @@ void flux_x(double *state , double *flux , double dt) {
       FLUX_(ID_RHOT, k, i) = rhot;
     }
   }
+  }
+  
 }
 
 //Compute the time tendencies of the fluid state using forcing in the x-direction
@@ -802,11 +879,12 @@ bool fuse_flux_update,double *state_init, double *state_out ) {
   double hv_coef;
   //Compute the hyperviscosity coefficient
   hv_coef = -hv_beta * dz / (16*dt);
-  double dens_prev, umom_prev, wmom_prev, rhot_prev;
+  
   //Compute fluxes in the x-direction for each cell
   if (fuse_flux_update) {
 #pragma omp parallel for  collapse(1)
     for (i=0; i<nx; i++) {
+      double dens_prev, umom_prev, wmom_prev, rhot_prev;
       k = 0;
     auto [dens, umom, wmom, rhot] = do_flux_z(state, hv_coef, k ,i);
     dens_prev = dens; umom_prev = umom; wmom_prev = wmom; rhot_prev = rhot;
