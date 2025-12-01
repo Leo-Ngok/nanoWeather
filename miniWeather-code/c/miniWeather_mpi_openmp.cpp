@@ -147,6 +147,7 @@ double *state_tmp;            //Fluid state.             Dimensions: (1-hs:nx+hs
 double *flux;                 //Cell interface fluxes.   Dimensions: (nx+1,nz+1,NUM_VARS)
 // initial configurations
 #define FLUX_(ll, z, x) flux[(ll)*(nz+1)*(nx+1) + (z)*(nx+1) + (x)]
+#define FLUX_Z_(ll, z, x) flux[(ll) * (nz + 1) * (nx + 1) + (x) * (nz + 1) + (z)]
 // in most cases z -> x -> ll
 
 
@@ -243,7 +244,7 @@ void   reduce_tendencies_halo_x( double *state , double *flux , double *tend , d
 void   compute_tendencies_z ( double *state , double *flux , double *tend , double dt, bool direct = false, double *state_init = nullptr, double *state_out = nullptr);
 void   flux_x               ( double *state , double *flux , double dt, int x0, int x1);
 void   flux_halo_x               ( double *state , double *flux , double dt);
-void   flux_z               ( double *state , double *flux , double dt);
+void   flux_z               ( double *state , double *flux , double dt, bool direct = false);
 void   send_halo_values_x    ( double *state );
 void   recv_halo_values_x    ( double *state );
 void   set_halo_values_z    ( double *state );
@@ -629,11 +630,6 @@ void flux_x(double *state , double *flux , double dt, int x0, int x1) {
   const int x8_end = sten_size - hs + x8;
   #pragma omp parallel for collapse(1)
   for (k=0; k<nz; k++) {
-    // double hy_dens_cell_khs = hy_dens_cell[k + hs];
-    // double hy_dens_theta_cell_khs = hy_dens_theta_cell[k + hs];
-    // for (i=sten_size - hs; i < nx + 1 - (sten_size - hs); i++) {
-    //   flux_x_zx(state, flux, hv_coef, dt, k, i);
-    // }
     for(i = sten_size - hs; i < x8_end; i += 8) {
       flux_x_zx_v2(state, flux, hv_coef, dt, k ,i);
     }
@@ -675,9 +671,7 @@ bool direct, double *state_init, double *state_out) {
   for (ll=0; ll<NUM_VARS; ll++) {
     for (k=0; k<nz; k++) {
       #pragma omp simd
-      // for (i=0; i<nx; i++) {
       for(i = (sten_size - hs); i < nx - (sten_size - hs); i++) {
-        // TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
         STATE_OUT(ll, k + hs, i + hs) = STATE_INIT(ll, k + hs, i + hs) -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx * dt;
       }
     }
@@ -687,7 +681,6 @@ bool direct, double *state_init, double *state_out) {
   for (ll=0; ll<NUM_VARS; ll++) {
     for (k=0; k<nz; k++) {
       #pragma omp simd
-      // for (i=0; i<nx; i++) {
       for(i = (sten_size - hs); i < nx - (sten_size - hs); i++) {
         TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
       }
@@ -706,13 +699,11 @@ bool direct,double *state_init, double *state_out) {
     for (k=0; k<nz; k++) {
       #pragma unroll
       for (i=0; i<(sten_size - hs); i++) {
-        // TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
         STATE_OUT(ll, k + hs, i + hs) = STATE_INIT(ll, k + hs, i + hs) -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx * dt;
       }
       
       #pragma unroll
       for (i=nx - (sten_size - hs); i<nx; i++) {
-        // TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
         STATE_OUT(ll, k + hs, i + hs) = STATE_INIT(ll, k + hs, i + hs) -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx * dt;
       }
     }
@@ -737,53 +728,81 @@ bool direct,double *state_init, double *state_out) {
 
 }
 
-void flux_z(double *state , double *flux , double dt) {
+auto do_flux_z_zx(double *state, double hv_coef, int k, int i) {
+  double r,u,w,t,p, stencil[sten_size], d3_vals[NUM_VARS], vals[NUM_VARS];
+  #pragma unroll
+  for (int ll=0; ll<NUM_VARS; ll++) {
+    #pragma unroll
+    for (int s=0; s<sten_size; s++) {
+      stencil[s] = STATE(ll, k + s, i + hs);
+    }
+    //Fourth-order-accurate interpolation of the state
+    vals[ll] = -stencil[0]/12 + 7*stencil[1]/12 + 7*stencil[2]/12 - stencil[3]/12;
+    //First-order-accurate interpolation of the third spatial derivative of the state
+    d3_vals[ll] = -stencil[0] + 3*(stencil[1] - stencil[2]) + stencil[3];
+  }
+
+  //Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p respectively)
+  // density
+  r = vals[ID_DENS] + hy_dens_int[k];
+  u = vals[ID_UMOM] / r;
+  w = vals[ID_WMOM] / r;
+  // potential temperature
+  t = ( vals[ID_RHOT] + hy_dens_theta_int[k] ) / r;
+  // pressure
+  // p = C0*pow_pole((r*t),gamm) - hy_pressure_int[k];
+  p = C0_pow_pole(r * t) - hy_pressure_int[k];
+  //Enforce vertical boundary condition and exact mass conservation
+  if (k == 0 || k == nz) {
+    w                = 0;
+    d3_vals[ID_DENS] = 0;
+  }
+
+  //Compute the flux vector with hyperviscosity
+  return std::make_tuple(
+    r*w     - hv_coef*d3_vals[ID_DENS],
+    r*w*u   - hv_coef*d3_vals[ID_UMOM],
+    r*w*w+p - hv_coef*d3_vals[ID_WMOM],
+    r*w*t   - hv_coef*d3_vals[ID_RHOT]
+  );
+}
+
+void flux_z(double *state , double *flux , double dt, bool direct) {
   // loop variables
   int k, i, ll, s;
-  int inds;
-  double r,u,w,t,p, stencil[sten_size], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
-  //Compute the hyperviscosity coefficient
-  hv_coef = -hv_beta * dz / (16*dt);
-  //Compute fluxes in the x-direction for each cell
-#pragma omp parallel for private(inds,stencil,vals,d3_vals,r,u,w,t,p,ll,s) collapse(2)
-  for (k=0; k<nz+1; k++) {
+  // hyper-viscosity coefficient
+  double  hv_coef  = -hv_beta * dz / (16*dt);
+
+  if (direct ) {
+    double dens_prev, umom_prev, wmom_prev, rhot_prev;    
+    //Compute fluxes in the x-direction for each cell
+    #pragma omp parallel for private(inds,stencil,vals,d3_vals,r,u,w,t,p,ll,s) collapse(1)
     for (i=0; i<nx; i++) {
       //Use fourth-order interpolation from four cell averages to compute the value at the interface in question
-      #pragma unroll
-      for (ll=0; ll<NUM_VARS; ll++) {
-        #pragma unroll
-        for (s=0; s<sten_size; s++) {
-          // inds = ll*(nz+2*hs)*(nx+2*hs) + (k+s)*(nx+2*hs) + i+hs;
-          stencil[s] = STATE(ll, k + s, i + hs);//state[inds];
-        }
-        //Fourth-order-accurate interpolation of the state
-        vals[ll] = -stencil[0]/12 + 7*stencil[1]/12 + 7*stencil[2]/12 - stencil[3]/12;
-        //First-order-accurate interpolation of the third spatial derivative of the state
-        d3_vals[ll] = -stencil[0] + 3*(stencil[1] - stencil[2]) + stencil[3];
-      }
+      for (k=0; k<nz+1; k++) {
 
-      //Compute density, u-wind, w-wind, potential temperature, and pressure (r,u,w,t,p respectively)
-      // density
-      r = vals[ID_DENS] + hy_dens_int[k];
-      u = vals[ID_UMOM] / r;
-      w = vals[ID_WMOM] / r;
-      // potential temperature
-      t = ( vals[ID_RHOT] + hy_dens_theta_int[k] ) / r;
-      // pressure
-      // p = C0*pow_pole((r*t),gamm) - hy_pressure_int[k];
-      p = C0_pow_pole(r * t) - hy_pressure_int[k];
-      //Enforce vertical boundary condition and exact mass conservation
-      if (k == 0 || k == nz) {
-        w                = 0;
-        d3_vals[ID_DENS] = 0;
+        auto [dens, umom, wmom, rhot] = do_flux_z_zx(state, hv_coef, k, i);
+        FLUX_Z_(ID_DENS, k, i) = dens;
+        FLUX_Z_(ID_UMOM, k, i) = umom;
+        FLUX_Z_(ID_WMOM, k, i) = wmom;
+        FLUX_Z_(ID_RHOT, k, i) = rhot;
+        //Compute the flux vector with hyperviscosity
       }
-
-      //Compute the flux vector with hyperviscosity
-      FLUX_(ID_DENS, k, i) = r*w     - hv_coef*d3_vals[ID_DENS];
-      FLUX_(ID_UMOM, k, i) = r*w*u   - hv_coef*d3_vals[ID_UMOM];
-      FLUX_(ID_WMOM, k, i) = r*w*w+p - hv_coef*d3_vals[ID_WMOM];
-      FLUX_(ID_RHOT, k, i) = r*w*t   - hv_coef*d3_vals[ID_RHOT];
     }
+  } else {
+    
+  //Compute fluxes in the x-direction for each cell
+#pragma omp parallel for private(inds,stencil,vals,d3_vals,r,u,w,t,p,ll,s) collapse(1)
+    for (i=0; i<nx; i++) {
+      //Use fourth-order interpolation from four cell averages to compute the value at the interface in question
+  for (k=0; k<nz+1; k++) {
+        auto [dens, umom, wmom, rhot] = do_flux_z_zx(state, hv_coef, k, i);
+        FLUX_Z_(ID_DENS, k, i) = dens;
+        FLUX_Z_(ID_UMOM, k, i) = umom;
+        FLUX_Z_(ID_WMOM, k, i) = wmom;
+        FLUX_Z_(ID_RHOT, k, i) = rhot;
+    }
+  }
   }
 }
 
@@ -800,29 +819,25 @@ bool direct, double *state_init, double *state_out) {
   //Use the fluxes to compute tendencies for each cell
   for (ll=0; ll<2; ll++) {
     #pragma omp parallel for schedule(static)
-    for (k=0; k<nz; k++) {
-      #pragma omp simd
       for (i=0; i<nx; i++) {
-        // TEND_(ll, k, i) =  -(FLUX_(ll, k+1, i) - FLUX_(ll, k, i)) * invdz;
-        STATE_OUT(ll, k + hs, i + hs) = STATE_INIT(ll, k + hs, i + hs) -(FLUX_(ll, k+1, i) - FLUX_(ll, k, i)) * invdz * dt;
+      #pragma omp simd
+    for (k=0; k<nz; k++) {
+        STATE_OUT(ll, k + hs, i + hs) = STATE_INIT(ll, k + hs, i + hs) -(FLUX_Z_(ll, k+1, i) - FLUX_Z_(ll, k, i)) * invdz * dt;
       }
     }
   }
   #pragma omp parallel for schedule(static)
-  for(k = 0; k < nz; k++) {
-    #pragma omp simd
     for(i = 0; i < nx; i++){
-      // TEND_(ID_WMOM, k, i) = -(FLUX_(ID_WMOM, k+1, i) - FLUX_(ID_WMOM, k, i)) * invdz - STATE(ID_DENS, k + hs, i + hs);
-        STATE_OUT(ID_WMOM, k + hs, i + hs) = STATE_INIT(ID_WMOM, k + hs, i + hs) -(FLUX_(ID_WMOM, k+1, i) - FLUX_(ID_WMOM, k, i)) * invdz * dt- STATE(ID_DENS, k + hs, i + hs) * dt;
+    #pragma omp simd
+  for(k = 0; k < nz; k++) {
+        STATE_OUT(ID_WMOM, k + hs, i + hs) = STATE_INIT(ID_WMOM, k + hs, i + hs) -(FLUX_Z_(ID_WMOM, k+1, i) - FLUX_Z_(ID_WMOM, k, i)) * invdz * dt- STATE(ID_DENS, k + hs, i + hs) * dt;
     }
   }
   #pragma omp parallel for schedule(static)
-    for (k=0; k<nz; k++) {
-      #pragma omp simd
       for (i=0; i<nx; i++) {
-        // TEND_(ID_RHOT, k, i) =  -(FLUX_(ID_RHOT, k+1, i) - FLUX_(ID_RHOT, k, i)) * invdz;
-        
-        STATE_OUT(ID_RHOT, k + hs, i + hs) = STATE_INIT(ID_RHOT, k + hs, i + hs) -(FLUX_(ID_RHOT, k+1, i) - FLUX_(ID_RHOT, k, i)) * invdz * dt;
+      #pragma omp simd
+    for (k=0; k<nz; k++) {
+        STATE_OUT(ID_RHOT, k + hs, i + hs) = STATE_INIT(ID_RHOT, k + hs, i + hs) -(FLUX_Z_(ID_RHOT, k+1, i) - FLUX_Z_(ID_RHOT, k, i)) * invdz * dt;
       }
     }
   } else {
@@ -830,25 +845,25 @@ bool direct, double *state_init, double *state_out) {
   //Use the fluxes to compute tendencies for each cell
   for (ll=0; ll<2; ll++) {
     #pragma omp parallel for schedule(static)
-    for (k=0; k<nz; k++) {
-      #pragma omp simd
       for (i=0; i<nx; i++) {
-        TEND_(ll, k, i) =  -(FLUX_(ll, k+1, i) - FLUX_(ll, k, i)) * invdz;
+      #pragma omp simd
+    for (k=0; k<nz; k++) {
+        TEND_(ll, k, i) =  -(FLUX_Z_(ll, k+1, i) - FLUX_Z_(ll, k, i)) * invdz;
       }
     }
   }
   #pragma omp parallel for schedule(static)
-  for(k = 0; k < nz; k++) {
-    #pragma omp simd
     for(i = 0; i < nx; i++){
-      TEND_(ID_WMOM, k, i) = -(FLUX_(ID_WMOM, k+1, i) - FLUX_(ID_WMOM, k, i)) * invdz - STATE(ID_DENS, k + hs, i + hs);
+    #pragma omp simd
+  for(k = 0; k < nz; k++) {
+      TEND_(ID_WMOM, k, i) = -(FLUX_Z_(ID_WMOM, k+1, i) - FLUX_Z_(ID_WMOM, k, i)) * invdz - STATE(ID_DENS, k + hs, i + hs);
     }
   }
   #pragma omp parallel for schedule(static)
-    for (k=0; k<nz; k++) {
-      #pragma omp simd
       for (i=0; i<nx; i++) {
-        TEND_(ID_RHOT, k, i) =  -(FLUX_(ID_RHOT, k+1, i) - FLUX_(ID_RHOT, k, i)) * invdz;
+      #pragma omp simd
+    for (k=0; k<nz; k++) {
+        TEND_(ID_RHOT, k, i) =  -(FLUX_Z_(ID_RHOT, k+1, i) - FLUX_Z_(ID_RHOT, k, i)) * invdz;
       }
     }
   }
