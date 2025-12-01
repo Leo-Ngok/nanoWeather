@@ -95,9 +95,12 @@
 # `which vtune` -collect hotspots -r ../vtune_res$1 \
 # ./build/openmp > logs/openmp_test_profile_$1.log
 
+
+# -genv I_MPI_OFI_PROVIDER=shm:ofi \
 # 2 x 48
 salloc --nodes=2 --exclusive \
-mpirun -np 96 -ppn 48 -bind-to core -genv I_MPI_DEBUG=5 -genv I_MPI_PIN=1 -genv I_MPI_PIN_DOMAIN=core \
+mpirun -np 96 -ppn 48 -bind-to core \
+-genv I_MPI_DEBUG=5 -genv I_MPI_PIN=1 -genv I_MPI_PIN_DOMAIN=core \
 -genv OMP_NUM_THREADS=1 -genv OMP_PLACES=threads -genv OMP_PROC_BIND=close \
 `which vtune` -collect hotspots -r ../vtune_res$1 \
 ./build/openmp > logs/openmp_test_profile_$1.log

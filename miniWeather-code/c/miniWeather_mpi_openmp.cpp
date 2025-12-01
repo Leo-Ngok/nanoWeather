@@ -141,7 +141,8 @@ double *state_tmp;            //Fluid state.             Dimensions: (1-hs:nx+hs
 
 // #define STATE_LIKE(state_, ll, z, x) state_[(ll)*(nz+2*hs)*(nx+2*hs) + (z)*(nx+2*hs) + (x)]
 #define STATE(ll, z, x) state[(ll) * (nz + 2 * hs) * (nx + 2 * hs) + (z) * (nx + 2 * hs) + (x)]
-
+#define STATE_INIT(ll, z, x) state_init[(ll)*(nz+2*hs)*(nx+2*hs) + (z)*(nx+2*hs) + (x)]
+#define STATE_OUT(ll, z, x) state_out[(ll)*(nz+2*hs)*(nx+2*hs) + (z)*(nx+2*hs) + (x)]
 // [nx + 1][nz + 1][NUM_VARS]
 double *flux;                 //Cell interface fluxes.   Dimensions: (nx+1,nz+1,NUM_VARS)
 // initial configurations
@@ -236,9 +237,10 @@ double sample_ellipse_cosine( double x , double z , double amp , double x0 , dou
 void   output               ( double *state , double etime );
 void   ncwrap               ( int ierr , int line );
 void   perform_timestep     ( double *state , double *state_tmp , double *flux , double *tend , double dt );
-void   semi_discrete_step   ( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux , double *tend );
-void   reduce_tendencies_x ( double *state , double *flux , double *tend , double dt);
-void   compute_tendencies_z ( double *state , double *flux , double *tend , double dt);
+void   semi_discrete_step   ( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux , double *tend , bool reuse_halo_x);
+void   reduce_tendencies_x ( double *state , double *flux , double *tend , double dt, bool direct = false, double *state_init = nullptr, double *state_final = nullptr);
+void   reduce_tendencies_halo_x( double *state , double *flux , double *tend , double dt , bool direct = false,double *state_init = nullptr, double *state_final = nullptr);
+void   compute_tendencies_z ( double *state , double *flux , double *tend , double dt, bool direct = false, double *state_init = nullptr, double *state_out = nullptr);
 void   flux_x               ( double *state , double *flux , double dt, int x0, int x1);
 void   flux_halo_x               ( double *state , double *flux , double dt);
 void   flux_z               ( double *state , double *flux , double dt);
@@ -350,22 +352,22 @@ int main(int argc, char **argv) {
 void perform_timestep( double *state , double *state_tmp , double *flux , double *tend , double dt ) {
   if (direction_switch) {
     //x-direction first
-    semi_discrete_step( state , state     , state_tmp , dt / 3 , DIR_X , flux , tend );
-    semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_X , flux , tend );
-    semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_X , flux , tend );
+    semi_discrete_step( state , state     , state_tmp , dt / 3 , DIR_X , flux , tend , false);
+    semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_X , flux , tend , true);
+    semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_X , flux , tend , true);
     //z-direction second
-    semi_discrete_step( state , state     , state_tmp , dt / 3 , DIR_Z , flux , tend );
-    semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_Z , flux , tend );
-    semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_Z , flux , tend );
+    semi_discrete_step( state , state     , state_tmp , dt / 3 , DIR_Z , flux , tend , false);
+    semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_Z , flux , tend , false);
+    semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_Z , flux , tend , false);
   } else {
     //z-direction second
-    semi_discrete_step( state , state     , state_tmp , dt / 3 , DIR_Z , flux , tend );
-    semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_Z , flux , tend );
-    semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_Z , flux , tend );
+    semi_discrete_step( state , state     , state_tmp , dt / 3 , DIR_Z , flux , tend , false);
+    semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_Z , flux , tend , false);
+    semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_Z , flux , tend , false);
     //x-direction first
-    semi_discrete_step( state , state     , state_tmp , dt / 3 , DIR_X , flux , tend );
-    semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_X , flux , tend );
-    semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_X , flux , tend );
+    semi_discrete_step( state , state     , state_tmp , dt / 3 , DIR_X , flux , tend ,false);
+    semi_discrete_step( state , state_tmp , state_tmp , dt / 2 , DIR_X , flux , tend , true);
+    semi_discrete_step( state , state_tmp , state     , dt / 1 , DIR_X , flux , tend , true);
   }
   if (direction_switch) { direction_switch = 0; } else { direction_switch = 1; }
 }
@@ -374,74 +376,186 @@ void perform_timestep( double *state , double *state_tmp , double *flux , double
 //Perform a single semi-discretized step in time with the form:
 //state_out = state_init + dt * rhs(state_forcing)
 //Meaning the step starts from state_init, computes the rhs using state_forcing, and stores the result in state_out
-void semi_discrete_step( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux , double *tend ) {
+void semi_discrete_step( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux , double *tend , bool resue_halo_x) {
   int i, k, ll, inds, indw;
   double x, z, wpert, dist, x0, z0, xrad, zrad, amp;
   if        (dir == DIR_X) {
     //Set the halo values for this MPI task's fluid state in the x-direction
-    send_halo_values_x(state_forcing);
+    // if(!resue_halo_x) {
+      send_halo_values_x(state_forcing);
+    // }
     //Compute the time tendencies for the fluid state in the x-direction
     flux_x(state_forcing, flux, dt, sten_size - hs, nx + 1 - (sten_size - hs));
+    if constexpr(data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
+      reduce_tendencies_x(state_forcing,flux,tend,dt);
+      #pragma omp parallel for private(inds,x,z,x0,z0,xrad,zrad,amp,dist,wpert,indw) collapse(2/*3*/)
+      for (ll=0; ll<NUM_VARS; ll++) {
+        for (k=0; k<nz; k++) {
+          #pragma omp simd
+          // for (i=0; i<nx8; i+=8) {
+          for(i = (sten_size - hs); i < nx - (sten_size - hs); i++) {
+            if constexpr(data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
+              x = (i_beg + i+0.5)*dx;
+              z = (k_beg + k+0.5)*dz;
+              // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare target" in OpenMP offload
+              // Neither of these are particularly well supported. So I'm manually inlining here
+              // wpert = sample_ellipse_cosine( x,z , 0.01 , xlen/8,1000., 500.,500. );
+              {
+                x0   = xlen/8;
+                z0   = 1000;
+                xrad = 500;
+                zrad = 500;
+                amp  = 0.01;
+                //Compute distance from bubble center
+                dist = sqrt( ((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad) ) * pi / 2.;
+                //If the distance from bubble center is less than the radius, create a cos**2 profile
+                if (dist <= pi / 2.) {
+                  wpert = amp * pow(cos(dist),2.);
+                } else {
+                  wpert = 0.;
+                }
+              }
+              // indw = ID_WMOM*nz*nx + k*nx + i;
+              // tend[indw] += wpert*hy_dens_cell[hs+k];
+              TEND_(ID_WMOM, k, i) = wpert*hy_dens_cell[hs+k];
+            }
+            inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
+            state_out[inds] = state_init[inds] + dt * TEND_(ll, k, i);
+          }
+        }
+      }
+    } else {
+      reduce_tendencies_x(state_forcing,flux,tend,dt, true, state_init, state_out);
+    }
+    
     recv_halo_values_x(state_forcing);
     flux_halo_x(state_forcing, flux, dt);
-    // flux_x(state_forcing, flux, dt, 0, sten_size - hs);
-    // flux_x(state_forcing, flux, dt, nx + 1 - (sten_size - hs), nx + 1);
-    reduce_tendencies_x(state_forcing,flux,tend,dt);
+    if constexpr(data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
+      reduce_tendencies_halo_x(state_forcing, flux, tend, dt);
+    #pragma omp parallel for private(inds,x,z,x0,z0,xrad,zrad,amp,dist,wpert,indw) collapse(2/*3*/)
+    for (ll=0; ll<NUM_VARS; ll++) {
+      for (k=0; k<nz; k++) {
+        #pragma omp simd
+        // for (i=0; i<nx8; i+=8) {
+        for(i = 0; i < sten_size -hs; i++) {
+          if constexpr(data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
+            x = (i_beg + i+0.5)*dx;
+            z = (k_beg + k+0.5)*dz;
+            // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare target" in OpenMP offload
+            // Neither of these are particularly well supported. So I'm manually inlining here
+            // wpert = sample_ellipse_cosine( x,z , 0.01 , xlen/8,1000., 500.,500. );
+            {
+              x0   = xlen/8;
+              z0   = 1000;
+              xrad = 500;
+              zrad = 500;
+              amp  = 0.01;
+              //Compute distance from bubble center
+              dist = sqrt( ((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad) ) * pi / 2.;
+              //If the distance from bubble center is less than the radius, create a cos**2 profile
+              if (dist <= pi / 2.) {
+                wpert = amp * pow(cos(dist),2.);
+              } else {
+                wpert = 0.;
+              }
+            }
+            // indw = ID_WMOM*nz*nx + k*nx + i;
+            // tend[indw] += wpert*hy_dens_cell[hs+k];
+            TEND_(ID_WMOM, k, i) = wpert*hy_dens_cell[hs+k];
+          }
+          // inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
+          // state_out[inds] = state_init[inds] + dt * TEND_(ll, k, i);
+          STATE_OUT(ll, k + hs, i+hs) = STATE_INIT(ll, k+ hs, i + hs) + dt * TEND_(ll, k, i);
+        }
+
+        
+        for(i = nx - (sten_size - hs); i < nx; i++) {
+          if constexpr(data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
+            x = (i_beg + i+0.5)*dx;
+            z = (k_beg + k+0.5)*dz;
+            // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare target" in OpenMP offload
+            // Neither of these are particularly well supported. So I'm manually inlining here
+            // wpert = sample_ellipse_cosine( x,z , 0.01 , xlen/8,1000., 500.,500. );
+            {
+              x0   = xlen/8;
+              z0   = 1000;
+              xrad = 500;
+              zrad = 500;
+              amp  = 0.01;
+              //Compute distance from bubble center
+              dist = sqrt( ((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad) ) * pi / 2.;
+              //If the distance from bubble center is less than the radius, create a cos**2 profile
+              if (dist <= pi / 2.) {
+                wpert = amp * pow(cos(dist),2.);
+              } else {
+                wpert = 0.;
+              }
+            }
+            // indw = ID_WMOM*nz*nx + k*nx + i;
+            // tend[indw] += wpert*hy_dens_cell[hs+k];
+            TEND_(ID_WMOM, k, i) = wpert*hy_dens_cell[hs+k];
+          }
+          // inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
+          // state_out[inds] = state_init[inds] + dt * TEND_(ll, k, i);
+          STATE_OUT(ll, k + hs, i+hs) = STATE_INIT(ll, k+ hs, i + hs) + dt * TEND_(ll, k, i);
+        }
+      }
+    }
+    } else {
+      reduce_tendencies_halo_x(state_forcing, flux, tend, dt, true, state_init, state_out);
+    }
+    
   } else if (dir == DIR_Z) {
     //Set the halo values for this MPI task's fluid state in the z-direction
     set_halo_values_z(state_forcing);
     //Compute the time tendencies for the fluid state in the z-direction
     flux_z(state_forcing, flux, dt);
+    if constexpr(data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
+      
     compute_tendencies_z(state_forcing,flux,tend,dt);
-  }
 
-  //Apply the tendencies to the fluid state
-#pragma omp parallel for private(inds,x,z,x0,z0,xrad,zrad,amp,dist,wpert,indw) collapse(2/*3*/)
-  for (ll=0; ll<NUM_VARS; ll++) {
-    for (k=0; k<nz; k++) {
-      // int nx8 = nx & -8;
-      #pragma omp simd
-      #pragma unroll(4)
-      // for (i=0; i<nx8; i+=8) {
-      for(i = 0; i < nx; i++) {
-        if constexpr(data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
-          x = (i_beg + i+0.5)*dx;
-          z = (k_beg + k+0.5)*dz;
-          // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare target" in OpenMP offload
-          // Neither of these are particularly well supported. So I'm manually inlining here
-          // wpert = sample_ellipse_cosine( x,z , 0.01 , xlen/8,1000., 500.,500. );
-          {
-            x0   = xlen/8;
-            z0   = 1000;
-            xrad = 500;
-            zrad = 500;
-            amp  = 0.01;
-            //Compute distance from bubble center
-            dist = sqrt( ((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad) ) * pi / 2.;
-            //If the distance from bubble center is less than the radius, create a cos**2 profile
-            if (dist <= pi / 2.) {
-              wpert = amp * pow(cos(dist),2.);
-            } else {
-              wpert = 0.;
+    // fluid state tendencies
+    #pragma omp parallel for private(inds,x,z,x0,z0,xrad,zrad,amp,dist,wpert,indw) collapse(2/*3*/)
+    for (ll=0; ll<NUM_VARS; ll++) {
+      for (k=0; k<nz; k++) {
+        #pragma omp simd
+        // for (i=0; i<nx8; i+=8) {
+        for(i = 0; i < nx; i++) {
+          if constexpr(data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
+            x = (i_beg + i+0.5)*dx;
+            z = (k_beg + k+0.5)*dz;
+            // Using sample_ellipse_cosine requires "acc routine" in OpenACC and "declare target" in OpenMP offload
+            // Neither of these are particularly well supported. So I'm manually inlining here
+            // wpert = sample_ellipse_cosine( x,z , 0.01 , xlen/8,1000., 500.,500. );
+            {
+              x0   = xlen/8;
+              z0   = 1000;
+              xrad = 500;
+              zrad = 500;
+              amp  = 0.01;
+              //Compute distance from bubble center
+              dist = sqrt( ((x-x0)/xrad)*((x-x0)/xrad) + ((z-z0)/zrad)*((z-z0)/zrad) ) * pi / 2.;
+              //If the distance from bubble center is less than the radius, create a cos**2 profile
+              if (dist <= pi / 2.) {
+                wpert = amp * pow(cos(dist),2.);
+              } else {
+                wpert = 0.;
+              }
             }
+            // indw = ID_WMOM*nz*nx + k*nx + i;
+            // tend[indw] += wpert*hy_dens_cell[hs+k];
+            TEND_(ID_WMOM, k, i) = wpert*hy_dens_cell[hs+k];
           }
-          // indw = ID_WMOM*nz*nx + k*nx + i;
-          // tend[indw] += wpert*hy_dens_cell[hs+k];
-          TEND_(ID_WMOM, k, i) = wpert*hy_dens_cell[hs+k];
+          inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
+          state_out[inds] = state_init[inds] + dt * TEND_(ll, k, i);
         }
-        inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-        state_out[inds] = state_init[inds] + dt * TEND_(ll, k, i);
-        // state_out[inds+1] = state_init[inds+1] + dt * TEND_(ll, k, i+1);
-        // state_out[inds+2] = state_init[inds+2] + dt * TEND_(ll, k, i+2);
-        // state_out[inds+3] = state_init[inds+3] + dt * TEND_(ll, k, i+3);
-        // state_out[inds+4] = state_init[inds+4] + dt * TEND_(ll, k, i+4);
-        // state_out[inds+5] = state_init[inds+5] + dt * TEND_(ll, k, i+5);
-        // state_out[inds+6] = state_init[inds+6] + dt * TEND_(ll, k, i+6);
-        // state_out[inds+7] = state_init[inds+7] + dt * TEND_(ll, k, i+7);
-        // _mm512_storeu_pd(state_out + inds, _mm512_loadu_pd(state_init + inds) * _mm512_set1_pd(dt));
       }
     }
+    } else{
+      compute_tendencies_z(state_forcing, flux, tend, dt, true, state_init, state_out);
+    }
   }
+
 }
 
 // __always_inline
@@ -551,19 +665,76 @@ void flux_halo_x(double *state , double *flux , double dt) {
 //Since the halos are set in a separate routine, this will not require MPI
 //First, compute the flux vector at each cell interface in the x-direction (including hyperviscosity)
 //Then, compute the tendencies using those fluxes
-void reduce_tendencies_x( double *state , double *flux , double *tend , double dt ) {
+void reduce_tendencies_x( double *state , double *flux , double *tend , double dt , 
+bool direct, double *state_init, double *state_out) {
   int    i,k,ll,s;
 
   //Use the fluxes to compute tendencies for each cell
-#pragma omp parallel for  collapse(2)
+  if(direct) {
+    #pragma omp parallel for  collapse(2)
   for (ll=0; ll<NUM_VARS; ll++) {
     for (k=0; k<nz; k++) {
       #pragma omp simd
-      for (i=0; i<nx; i++) {
+      // for (i=0; i<nx; i++) {
+      for(i = (sten_size - hs); i < nx - (sten_size - hs); i++) {
+        // TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
+        STATE_OUT(ll, k + hs, i + hs) = STATE_INIT(ll, k + hs, i + hs) -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx * dt;
+      }
+    }
+  }
+  } else {
+    #pragma omp parallel for  collapse(2)
+  for (ll=0; ll<NUM_VARS; ll++) {
+    for (k=0; k<nz; k++) {
+      #pragma omp simd
+      // for (i=0; i<nx; i++) {
+      for(i = (sten_size - hs); i < nx - (sten_size - hs); i++) {
         TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
       }
     }
   }
+  }
+
+}
+
+void reduce_tendencies_halo_x( double *state , double *flux , double *tend , double dt, 
+bool direct,double *state_init, double *state_out) {
+  int    i,k,ll,s;
+  if(direct) {
+#pragma omp parallel for  collapse(2)
+  for (ll=0; ll<NUM_VARS; ll++) {
+    for (k=0; k<nz; k++) {
+      #pragma unroll
+      for (i=0; i<(sten_size - hs); i++) {
+        // TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
+        STATE_OUT(ll, k + hs, i + hs) = STATE_INIT(ll, k + hs, i + hs) -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx * dt;
+      }
+      
+      #pragma unroll
+      for (i=nx - (sten_size - hs); i<nx; i++) {
+        // TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
+        STATE_OUT(ll, k + hs, i + hs) = STATE_INIT(ll, k + hs, i + hs) -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx * dt;
+      }
+    }
+  }
+  } else {
+#pragma omp parallel for  collapse(2)
+  for (ll=0; ll<NUM_VARS; ll++) {
+    for (k=0; k<nz; k++) {
+      #pragma unroll
+      for (i=0; i<(sten_size - hs); i++) {
+        TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
+      }
+      
+      #pragma unroll
+      for (i=nx - (sten_size - hs); i<nx; i++) {
+        TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
+      }
+    }
+  }
+  }
+  //Use the fluxes to compute tendencies for each cell
+
 }
 
 void flux_z(double *state , double *flux , double dt) {
@@ -620,8 +791,41 @@ void flux_z(double *state , double *flux , double dt) {
 //Since the halos are set in a separate routine, this will not require MPI
 //First, compute the flux vector at each cell interface in the z-direction (including hyperviscosity)
 //Then, compute the tendencies using those fluxes
-void compute_tendencies_z( double *state , double *flux , double *tend , double dt ) {
+void compute_tendencies_z( double *state , double *flux , double *tend , double dt,
+bool direct, double *state_init, double *state_out) {
   int    i,k,ll,s;
+
+  if(direct) {
+
+  //Use the fluxes to compute tendencies for each cell
+  for (ll=0; ll<2; ll++) {
+    #pragma omp parallel for schedule(static)
+    for (k=0; k<nz; k++) {
+      #pragma omp simd
+      for (i=0; i<nx; i++) {
+        // TEND_(ll, k, i) =  -(FLUX_(ll, k+1, i) - FLUX_(ll, k, i)) * invdz;
+        STATE_OUT(ll, k + hs, i + hs) = STATE_INIT(ll, k + hs, i + hs) -(FLUX_(ll, k+1, i) - FLUX_(ll, k, i)) * invdz * dt;
+      }
+    }
+  }
+  #pragma omp parallel for schedule(static)
+  for(k = 0; k < nz; k++) {
+    #pragma omp simd
+    for(i = 0; i < nx; i++){
+      // TEND_(ID_WMOM, k, i) = -(FLUX_(ID_WMOM, k+1, i) - FLUX_(ID_WMOM, k, i)) * invdz - STATE(ID_DENS, k + hs, i + hs);
+        STATE_OUT(ID_WMOM, k + hs, i + hs) = STATE_INIT(ID_WMOM, k + hs, i + hs) -(FLUX_(ID_WMOM, k+1, i) - FLUX_(ID_WMOM, k, i)) * invdz * dt- STATE(ID_DENS, k + hs, i + hs) * dt;
+    }
+  }
+  #pragma omp parallel for schedule(static)
+    for (k=0; k<nz; k++) {
+      #pragma omp simd
+      for (i=0; i<nx; i++) {
+        // TEND_(ID_RHOT, k, i) =  -(FLUX_(ID_RHOT, k+1, i) - FLUX_(ID_RHOT, k, i)) * invdz;
+        
+        STATE_OUT(ID_RHOT, k + hs, i + hs) = STATE_INIT(ID_RHOT, k + hs, i + hs) -(FLUX_(ID_RHOT, k+1, i) - FLUX_(ID_RHOT, k, i)) * invdz * dt;
+      }
+    }
+  } else {
 
   //Use the fluxes to compute tendencies for each cell
   for (ll=0; ll<2; ll++) {
@@ -647,6 +851,7 @@ void compute_tendencies_z( double *state , double *flux , double *tend , double 
         TEND_(ID_RHOT, k, i) =  -(FLUX_(ID_RHOT, k+1, i) - FLUX_(ID_RHOT, k, i)) * invdz;
       }
     }
+  }
 }
 
 MPI_Request req_r[2], req_s[2];
@@ -684,7 +889,7 @@ void recv_halo_values_x(double *state) {
   int k, ll, ind_r, ind_u, ind_t, i, s, ierr;
   double z;
   //Unpack the receive buffers
-#pragma omp parallel for collapse(3)
+#pragma omp parallel for collapse(2)
   for (ll=0; ll<NUM_VARS; ll++) {
     for (k=0; k<nz; k++) {
       for (s=0; s<hs; s++) {
