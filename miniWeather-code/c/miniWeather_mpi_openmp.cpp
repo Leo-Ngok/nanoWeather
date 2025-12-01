@@ -244,8 +244,10 @@ void   output               ( double *state , double etime );
 void   ncwrap               ( int ierr , int line );
 void   perform_timestep     ( double *state , double *state_tmp , double *flux , double *tend , double dt );
 void   semi_discrete_step   ( double *state_init , double *state_forcing , double *state_out , double dt , int dir , double *flux , double *tend );
-void   compute_tendencies_x ( double *state , double *flux , double *tend , double dt);
-void   compute_tendencies_halo_x ( double *state , double *flux , double *tend , double dt);
+void   compute_tendencies_x ( double *state , double *flux , double *tend , double dt, bool fuse_tend_upd,
+                            double *state_init, double *state_out);
+void   compute_tendencies_halo_x ( double *state , double *flux , double *tend , double dt, bool fuse_tend_upd,
+                            double *state_init, double *state_out);
 void   compute_tendencies_z ( double *state , double *flux , double *tend , double dt);
 void   flux_x               ( double *state , double *flux , double dt);
 void   flux_halo_x          ( double *state , double *flux , double dt);
@@ -458,10 +460,10 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
       send_halo_values_x(state_forcing);
       flux_x(state_forcing, flux, dt);
       recv_halo_values_x(state_forcing);
-      compute_tendencies_x(state_forcing,flux,tend,dt);
+      compute_tendencies_x(state_forcing,flux,tend,dt, false, state_init, state_out);
       //Compute the time tendencies for the fluid state in the x-direction
       flux_halo_x(state_forcing, flux, dt);
-      compute_tendencies_halo_x(state_forcing,flux,tend,dt);
+      compute_tendencies_halo_x(state_forcing,flux,tend,dt, false, state_init, state_out);
       #pragma omp parallel for private(inds,indt,x,z,x0,z0,xrad,zrad,amp,dist,wpert,indw) collapse(2/*3*/)
       for (ll=0; ll<NUM_VARS; ll++) {
         // #pragma omp parallel for private(inds,indt,x,z,x0,z0,xrad,zrad,amp,dist,wpert,indw)
@@ -503,36 +505,11 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
     } else {
       send_halo_values_x(state_forcing);
       flux_x(state_forcing, flux, dt);
-      compute_tendencies_x(state_forcing,flux,tend,dt);
-      #pragma omp parallel for private(inds,indt,x,z,x0,z0,xrad,zrad,amp,dist,wpert,indw) collapse(2/*3*/)
-      for (ll=0; ll<NUM_VARS; ll++) {
-        // #pragma omp parallel for private(inds,indt,x,z,x0,z0,xrad,zrad,amp,dist,wpert,indw)
-        for (k=0; k<nz; k++) {
-          #pragma omp simd
-          for(i = sten_size - hs; i < nx - (sten_size - hs); i++) {
-            inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-            state_out[inds] = state_init[inds] + dt * TEND_(ll, k, i);
-          }
-        }
-      }
+      compute_tendencies_x(state_forcing,flux,tend,dt, true, state_init, state_out);
       recv_halo_values_x(state_forcing);
       //Compute the time tendencies for the fluid state in the x-direction
       flux_halo_x(state_forcing, flux, dt);
-      compute_tendencies_halo_x(state_forcing,flux,tend,dt);
-      #pragma omp parallel for private(inds,indt,x,z,x0,z0,xrad,zrad,amp,dist,wpert,indw) collapse(2/*3*/)
-      for (ll=0; ll<NUM_VARS; ll++) {
-        // #pragma omp parallel for private(inds,indt,x,z,x0,z0,xrad,zrad,amp,dist,wpert,indw)
-        for (k=0; k<nz; k++) {
-          for(i = 0; i < sten_size - hs; i++) {
-            inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-            state_out[inds] = state_init[inds] + dt * TEND_(ll, k, i);
-          }
-          for(i =nx - (sten_size - hs); i < nx; i++) {
-            inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
-            state_out[inds] = state_init[inds] + dt * TEND_(ll, k, i);
-          }
-        }
-      }
+      compute_tendencies_halo_x(state_forcing,flux,tend,dt, true, state_init, state_out);
     }
   
   } else if (dir == DIR_Z) {
@@ -722,41 +699,79 @@ void flux_x(double *state , double *flux , double dt) {
 //Since the halos are set in a separate routine, this will not require MPI
 //First, compute the flux vector at each cell interface in the x-direction (including hyperviscosity)
 //Then, compute the tendencies using those fluxes
-void compute_tendencies_x( double *state , double *flux , double *tend , double dt ) {
+void compute_tendencies_x( double *state , double *flux , double *tend , double dt , 
+bool fuse_tend_update,
+double *state_init, double *state_out) {
   // flux_x(state, flux, dt);
   int    i,k,ll,s;
-
-  //Use the fluxes to compute tendencies for each cell
+  if(fuse_tend_update) {//Use the fluxes to compute tendencies for each cell
+#pragma omp parallel for  collapse(2)
+  for (ll=0; ll<NUM_VARS; ll++) {
+    for (k=0; k<nz; k++) {
+      #pragma omp simd
+      for (i=sten_size - hs; i<nx - (sten_size - hs); i++) {
+        // TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
+        int inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
+        state_out[inds] = state_init[inds] -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx * dt;
+      }
+    }
+  }
+  } else {//Use the fluxes to compute tendencies for each cell
 #pragma omp parallel for  collapse(2)
   for (ll=0; ll<NUM_VARS; ll++) {
     for (k=0; k<nz; k++) {
       #pragma omp simd
       for (i=sten_size - hs; i<nx - (sten_size - hs); i++) {
         TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
+        // int inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
+        // state_out[inds] = state_init[inds] -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx * dt;
       }
     }
   }
+  }
+  
 }
 
 
-void compute_tendencies_halo_x( double *state , double *flux , double *tend , double dt ) {
+void compute_tendencies_halo_x( double *state , double *flux , double *tend , double dt , 
+bool fuse_tend_update,double *state_init, double *state_out) {
   // flux_x(state, flux, dt);
   int    i,k,ll,s;
-
+  if(fuse_tend_update) {
+    #pragma omp parallel for  collapse(2)
+      for (ll=0; ll<NUM_VARS; ll++) {
+        for (k=0; k<nz; k++) {
+          #pragma omp simd
+          for (i=0 ; i < (sten_size - hs); i++) {
+            // TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
+            int inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
+            state_out[inds] = state_init[inds] -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx * dt;
+          }
+          #pragma omp simd
+          for (i=nx - (sten_size - hs); i<nx; i++) {
+            // TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
+            int inds = ll*(nz+2*hs)*(nx+2*hs) + (k+hs)*(nx+2*hs) + i+hs;
+            state_out[inds] = state_init[inds] -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx * dt;
+          }
+        }
+      }
+  } else {
   //Use the fluxes to compute tendencies for each cell
-#pragma omp parallel for  collapse(2)
-  for (ll=0; ll<NUM_VARS; ll++) {
-    for (k=0; k<nz; k++) {
-      #pragma omp simd
-      for (i=0 ; i < (sten_size - hs); i++) {
-        TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
+    #pragma omp parallel for  collapse(2)
+      for (ll=0; ll<NUM_VARS; ll++) {
+        for (k=0; k<nz; k++) {
+          #pragma omp simd
+          for (i=0 ; i < (sten_size - hs); i++) {
+            TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
+          }
+          #pragma omp simd
+          for (i=nx - (sten_size - hs); i<nx; i++) {
+            TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
+          }
+        }
       }
-      #pragma omp simd
-      for (i=nx - (sten_size - hs); i<nx; i++) {
-        TEND_(ll, k, i) = -( FLUX_(ll, k, i + 1) - FLUX_(ll, k, i) ) * invdx;
-      }
-    }
   }
+
 }
 
 
