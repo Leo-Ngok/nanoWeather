@@ -18,6 +18,7 @@
 #include <climits>
 #include <cassert>
 #include <immintrin.h>
+#include <tuple>
 
 // Test Case Default Parameters.
 // override with cmake -DNX=Value ...
@@ -251,7 +252,8 @@ void   compute_tendencies_halo_x ( double *state , double *flux , double *tend ,
 void   compute_tendencies_z ( double *state , double *flux , double *tend , double dt, bool fuse_tend_update,double *state_init, double *state_out);
 void   flux_x               ( double *state , double *flux , double dt);
 void   flux_halo_x          ( double *state , double *flux , double dt);
-void   flux_z               ( double *state , double *flux , double dt);
+void   flux_z               ( double *state , double *flux , double dt,
+bool fuse_flux_update,double *state_init, double *state_out);
 void   set_halo_values_x    ( double *state );
 void   set_halo_values_z    ( double *state );
 void   reductions           ( double &mass , double &te );
@@ -517,7 +519,7 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
     set_halo_values_z(state_forcing);
     if constexpr(data_spec_int == DATA_SPEC_GRAVITY_WAVES) {
     //Compute the time tendencies for the fluid state in the z-direction
-    flux_z(state_forcing, flux, dt);
+    flux_z(state_forcing, flux, dt, false, state_init, state_out);
     compute_tendencies_z(state_forcing,flux,tend,dt, false, state_init, state_out);
       //Apply the tendencies to the fluid state
         #pragma omp parallel for private(inds,indt,x,z,x0,z0,xrad,zrad,amp,dist,wpert,indw) collapse(2/*3*/)
@@ -561,8 +563,13 @@ void semi_discrete_step( double *state_init , double *state_forcing , double *st
   
     } else {
     //Compute the time tendencies for the fluid state in the z-direction
-      flux_z(state_forcing, flux, dt);
+    if(state_forcing == state_out) {
+      flux_z(state_forcing, flux, dt, false, state_init, state_out);
       compute_tendencies_z(state_forcing,flux,tend,dt, true, state_init, state_out);
+    } else {
+      flux_z(state_forcing, flux, dt, true, state_init, state_out);
+      // compute_tendencies_z(state_forcing,flux,tend,dt, true, state_init, state_out);
+    }
       }
     }
 
@@ -781,19 +788,11 @@ bool fuse_tend_update,double *state_init, double *state_out) {
 
 }
 
-
-void flux_z(double *state , double *flux , double dt) {
-  // loop variables
-  int k, i, ll, s;
+auto do_flux_z(double *state, double hv_coef, int k, int i) {
   int inds;
-  double r,u,w,t,p, stencil[sten_size], d3_vals[NUM_VARS], vals[NUM_VARS], hv_coef;
-  //Compute the hyperviscosity coefficient
-  hv_coef = -hv_beta * dz / (16*dt);
-  //Compute fluxes in the x-direction for each cell
-#pragma omp parallel for private(inds,stencil,vals,d3_vals,r,u,w,t,p,ll,s) collapse(2)
-  for (k=0; k<nz+1; k++) {
-    for (i=0; i<nx; i++) {
-      //Use fourth-order interpolation from four cell averages to compute the value at the interface in question
+  int ll, s;
+  double r,u,w,t,p, stencil[sten_size], d3_vals[NUM_VARS], vals[NUM_VARS];
+ //Use fourth-order interpolation from four cell averages to compute the value at the interface in question
       #pragma unroll
       for (ll=0; ll<NUM_VARS; ll++) {
         #pragma unroll
@@ -823,11 +822,66 @@ void flux_z(double *state , double *flux , double dt) {
       }
 
       //Compute the flux vector with hyperviscosity
-      FLUX_(ID_DENS, k, i) = r*w     - hv_coef*d3_vals[ID_DENS];
-      FLUX_(ID_UMOM, k, i) = r*w*u   - hv_coef*d3_vals[ID_UMOM];
-      FLUX_(ID_WMOM, k, i) = r*w*w+p - hv_coef*d3_vals[ID_WMOM];
-      FLUX_(ID_RHOT, k, i) = r*w*t   - hv_coef*d3_vals[ID_RHOT];
+      // FLUX_(ID_DENS, k, i) = r*w     - hv_coef*d3_vals[ID_DENS];
+      // FLUX_(ID_UMOM, k, i) = r*w*u   - hv_coef*d3_vals[ID_UMOM];
+      // FLUX_(ID_WMOM, k, i) = r*w*w+p - hv_coef*d3_vals[ID_WMOM];
+      // FLUX_(ID_RHOT, k, i) = r*w*t   - hv_coef*d3_vals[ID_RHOT];
+      return std::make_tuple(
+        r*w     - hv_coef*d3_vals[ID_DENS],
+        r*w*u   - hv_coef*d3_vals[ID_UMOM],
+        r*w*w+p - hv_coef*d3_vals[ID_WMOM],
+        r*w*t   - hv_coef*d3_vals[ID_RHOT]
+      );
+}
+
+
+void flux_z(double *state , double *flux , double dt,
+bool fuse_flux_update,double *state_init, double *state_out ) {
+  // loop variables
+  int k, i;
+  double hv_coef;
+  //Compute the hyperviscosity coefficient
+  hv_coef = -hv_beta * dz / (16*dt);
+  double dens_prev, umom_prev, wmom_prev, rhot_prev;
+  //Compute fluxes in the x-direction for each cell
+  if (fuse_flux_update) {
+#pragma omp parallel for  collapse(1)
+    for (i=0; i<nx; i++) {
+      k = 0;
+    auto [dens, umom, wmom, rhot] = do_flux_z(state, hv_coef, k ,i);
+    dens_prev = dens; umom_prev = umom; wmom_prev = wmom; rhot_prev = rhot;
+  for (k=1; k<nz+1; k++) {
+      auto [dens, umom, wmom, rhot] = do_flux_z(state, hv_coef, k ,i);
+      double flux_curr[] = {dens, umom, wmom, rhot};
+      double flux_prev[] = {dens_prev, umom_prev, wmom_prev, rhot_prev};
+      // begin
+      for(int ll = 0; ll < NUM_VARS; ll++) {
+        double tend;
+        tend = - (flux_curr[ll] - flux_prev[ll]) * invdz;
+        int inds;
+        if (ll == ID_WMOM) {
+          inds = ID_DENS*(nz+2*hs)*(nx+2*hs) + (k-1+hs)*(nx+2*hs) + i+hs;
+          tend -= state[inds] * grav;
+          
+        }
+        inds = ll*(nz+2*hs)*(nx+2*hs) + (k-1+hs)*(nx+2*hs) + i+hs;
+        state_out[inds] = state_init[inds] + dt * tend;
+      }
+      // end
+    dens_prev = dens; umom_prev = umom; wmom_prev = wmom; rhot_prev = rhot;
     }
+  }
+  } else {
+#pragma omp parallel for  collapse(1)
+    for (i=0; i<nx; i++) {
+      for (k=0; k<nz+1; k++) {
+      auto [dens, umom, wmom, rhot] = do_flux_z(state, hv_coef, k ,i);
+      FLUX_(ID_DENS, k, i) = dens;
+      FLUX_(ID_UMOM, k, i) = umom;
+      FLUX_(ID_WMOM, k, i) = wmom;
+      FLUX_(ID_RHOT, k, i) = rhot;
+    }
+  }
   }
 }
 
@@ -841,10 +895,10 @@ bool fuse_tend_update,double *state_init, double *state_out ) {
   int    i,k,ll,s, inds, indf1, indf2, indt;
 
   //Use the fluxes to compute tendencies for each cell
-#pragma omp parallel for private(indt,indf1,indf2,inds) collapse(3)
+#pragma omp parallel for private(indt,indf1,indf2,inds) collapse(2)
   for (ll=0; ll<NUM_VARS; ll++) {
-    for (k=0; k<nz; k++) {
       for (i=0; i<nx; i++) {
+    for (k=0; k<nz; k++) {
         indt  = ll* nz   * nx    + k* nx    + i  ;
         double tend;
         tend =  -(FLUX_(ll, k+1, i) - FLUX_(ll, k, i)) * invdz;
