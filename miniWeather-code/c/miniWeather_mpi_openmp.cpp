@@ -172,7 +172,7 @@ inline __attribute__((always_inline))
 double pow_binomial(double base) {
   // there is no constexpr double pow(a, b)
   // so only this can solve. What a mess!!
-  static double x0_gamma = pow(X0, gamm);
+  static double x0_gamma = C0 * pow(X0, gamm);
   static double c1 =  1.400278940027894    * x0_gamma;
   static double c2 =  0.2802510849288743   * x0_gamma;
   static double c3 = -0.056024159237292384 * x0_gamma;
@@ -226,7 +226,7 @@ double pow_pole(double base, double exponent, bool probe_max=false) {
   // POW_X0_BRANCH(220) // 300, 360 mid = 270 = 180 * 1.5 
   // POW_X0_BRANCH(260) // 360, 420 mid = 270 = 180 * 1.5 
   // , "Don't try to even go here!!"
-  _base_max = _base_max < base ? base : _base_max;
+  // _base_max = _base_max < base ? base : _base_max;
   return pow(base, gamm);
 }
 
@@ -612,7 +612,7 @@ auto do_flux_x(double *state, double hv_coef, int k, int i) {
       u = vals[ID_UMOM] / r;
       w = vals[ID_WMOM] / r;
       t = ( vals[ID_RHOT] + hy_dens_theta_cell[k+hs] /*hy_dens_theta_cell_khs*/ ) / r;
-      p = C0*pow_pole((r*t),gamm);
+      p = pow_pole((r*t),gamm);
 
       //Compute the flux vector
       // FLUX_(ID_DENS, k, i) = r*u     - hv_coef*d3_vals[ID_DENS];
@@ -851,7 +851,7 @@ auto do_flux_z(double *state, double hv_coef, int k, int i) {
       // potential temperature
       t = ( vals[ID_RHOT] + hy_dens_theta_int[k] ) / r;
       // pressure
-      p = C0*pow_pole((r*t),gamm) - hy_pressure_int[k];
+      p = pow_pole((r*t),gamm) - hy_pressure_int[k];
       //Enforce vertical boundary condition and exact mass conservation
       if (k == 0 || k == nz) {
         w                = 0;
